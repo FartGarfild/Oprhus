@@ -200,7 +200,7 @@ detect_tools() {
 # ── Default Configuration ─────────────────────────────────────────────────────
 WORKERS=$(cpu_count)
 ROOT_DIR="/home"
-SIGNATURES="$SCRIPT_DIR/signatures.sha256"
+SIGNATURES="${SCRIPT_DIR}/signatures"
 MAX_SCAN_MB=10
 MAX_RAM_MB=500
 OUTPUT_FILE=""
@@ -284,9 +284,11 @@ EOF
         return
     fi
 
-    local sig_files=()
+local sig_files=()
     if [ -d "$sig_input" ]; then
-        while IFS= read -r -d '' sf; do sig_files+=("$sf"); done < <(find "$sig_input" -type f -print0 2>/dev/null)
+        while IFS= read -r -d '' sf; do 
+            sig_files+=("$sf")
+        done < <(find "$sig_input" -type f -print0 2>/dev/null)
     else
         sig_files+=("$sig_input")
     fi
@@ -319,10 +321,16 @@ EOF
                 print tolower(a[2]) "\tCustom.SHA256" >> (out "/sha256.tsv")
                 next
             }
-            if (line ~ /^str:/) { print substr(line, 5) >> (out "/strings.txt"); next }
-            if (line ~ /^b64sig:/) { print substr(line, 8) "\tCustom.B64" >> (out "/b64_payloads.tsv"); next }
+            if (line ~ /^str:/) { 
+                print substr(line, 5) >> (out "/strings.txt"); 
+                next 
+            }
+            if (line ~ /^b64sig:/) { 
+                print substr(line, 8) "\tCustom.B64" >> (out "/b64_payloads.tsv"); 
+                next 
+            }
 
-            # ClamAV Hash DB -> HASH:Size:Name
+            # ClamAV / Maldet hashes
             if (line ~ /^[0-9a-fA-F]{32,64}:[0-9*]+:/) {
                 split(line, a, ":")
                 h = tolower(a[1]); name = a[3]
@@ -331,30 +339,25 @@ EOF
                 next
             }
 
-            # ClamAV NDB -> Name:Type:Offset:HexSig:...
-            if (line ~ /:[0-9]+:[0-9*a-fA-F>=-]*:/) {
-                split(line, a, ":")
-                if (length(a) >= 4 && length(a[4]) >= 8) {
-                    ere = hex2ere(a[4])
+            # Hex signatures (ClamAV NDB, Maldet)
+            if (line ~ /:[0-9]+:[0-9*a-fA-F>=-]*:/ || line ~ /:[0-9a-fA-F?*{}|()]{10,}$/) {
+                n = split(line, a, ":")
+                if (length(a[n]) >= 8) {
+                    ere = hex2ere(a[n])
                     if (ere != "") print ere >> (out "/hex_ere.txt")
                 }
                 next
             }
-
-            # Maldet MD5 / Hex dat files
-            if (line ~ /^[0-9a-fA-F]{32}:/) {
-                split(line, a, ":")
-                print tolower(a[1]) "\t" a[2] >> (out "/md5.tsv")
-                next
-            }
-            if (line ~ /:[0-9a-fA-F?*{}|()]{10,}$/) {
-                n = split(line, a, ":")
-                ere = hex2ere(a[n])
-                if (ere != "") print ere >> (out "/hex_ere.txt")
-                next
-            }
         }
     ' "${sig_files[@]}" 2>/dev/null
+
+    echo "[*] Adding external hash lists..."
+    find "$sig_input" \( -name "*.sha256" -o -name "malwarebazaar.sha256" \) 2>/dev/null | while read -r f; do
+        [ -s "$f" ] && awk '{print $1 "\t" ($2 ? $2 : "External.Hash")}' "$f" >> "$out_dir/sha256.tsv"
+    done
+
+    mkdir -p "$out_dir/yara"
+    find "$sig_input"/yara -name "*.yar" -o -name "*.yara" 2>/dev/null | xargs -I {} cp {} "$out_dir/yara/" 2>/dev/null || true
 
     if [ -s "$out_dir/b64_payloads.tsv" ] && [ "$SHA256_CMD" != "none" ]; then
         local tmp_b64="$out_dir/b64_compiled.tsv"
@@ -368,7 +371,7 @@ EOF
     fi
 
     for f in sha256.tsv md5.tsv strings.txt hex_ere.txt b64_payloads.tsv; do
-        if [ -s "$out_dir/$f" ]; do
+        if [ -s "$out_dir/$f" ]; then
             sort -u "$out_dir/$f" -o "$out_dir/$f" 2>/dev/null || true
         fi
     done
@@ -377,6 +380,7 @@ EOF
     echo -e "    MD5 hashes       : ${C}$(wc -l < "$out_dir/md5.tsv" | tr -d ' ')${Z}"
     echo -e "    Hex ERE patterns : ${C}$(wc -l < "$out_dir/hex_ere.txt" | tr -d ' ')${Z}"
     echo -e "    String patterns  : ${C}$(wc -l < "$out_dir/strings.txt" | tr -d ' ')${Z}"
+    echo -e "    YARA rules       : ${C}$(find "$out_dir/yara" -name "*.ya*" 2>/dev/null | wc -l | tr -d ' ')${Z}"
     echo ""
 }
 
