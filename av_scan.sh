@@ -370,6 +370,29 @@ local sig_files=()
         mv -f "$tmp_b64" "$out_dir/b64_payloads.tsv" 2>/dev/null || touch "$out_dir/b64_payloads.tsv"
     fi
 
+    # ── Custom signatures (MD5, SHA256, strings) ─────────────────────────────
+    echo "[*] Loading custom signatures..."
+    local cdir=""
+    if [ -d "$sig_input/custom" ]; then
+        cdir="$sig_input/custom"
+    elif [ -d "$SIG_DIR/custom" ]; then
+        cdir="$SIG_DIR/custom"
+    fi
+
+    if [ -n "$cdir" ] && [ -d "$cdir" ]; then
+        # MD5
+        find "$cdir" -name "*.md5" -exec cat {} + 2>/dev/null >> "$out_dir/md5.tsv"
+        
+        # SHA256
+        find "$cdir" -name "*.sha256" -exec cat {} + 2>/dev/null >> "$out_dir/sha256.tsv"
+        
+        # Strings / regex / patterns
+        find "$cdir" -name "*.strings" -exec cat {} + 2>/dev/null >> "$out_dir/strings.txt"
+        
+        echo "    ✓ Custom signatures loaded from $cdir"
+    fi
+
+    # ── Final sort & unique ─────────────────────────────────
     for f in sha256.tsv md5.tsv strings.txt hex_ere.txt b64_payloads.tsv; do
         if [ -s "$out_dir/$f" ]; then
             sort -u "$out_dir/$f" -o "$out_dir/$f" 2>/dev/null || true
