@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Oprhus AV Scanner Unified v6.1
+# Oprhus AV Scanner Unified v6.2 (modular)
 # Best of v5.1 + v6.0 + Signature Updater
 #
 # Features:
@@ -27,17 +27,41 @@
 #   --no-busybox          Do not offer busybox download
 #   --mb-key KEY          MalwareBazaar Auth-Key (optional)
 #   -h, --help            Show this help
+#
+# ── Структура файлу ──────────────────────────────────────────────────────────
+#   1. GLOBALS         — усі змінні скрипта, визначені один раз тут
+#   2. MODULE: platform / cpu
+#   3. MODULE: hash & yara detection
+#   4. MODULE: busybox / strings / file fallback
+#   5. MODULE: CLI (usage, parse_args, colors)
+#   6. MODULE: worker sizing / RAM guard
+#   7. MODULE: signature updater
+#   8. MODULE: signature compiler
+#   9. MODULE: workdir & worker extraction
+#  10. MODULE: dependency check
+#  11. MODULE: file collection & worker orchestration
+#  12. MODULE: progress monitor / cleanup
+#  13. MODULE: reporting
+#  14. main()          — єдина точка, що викликає модулі в потрібному порядку
+#  15. EMBEDDED WORKER  — окремий self-contained скрипт (теж модульний)
 # =============================================================================
 set -uo pipefail
 export LC_ALL=C
 
-VERSION="6.1"
+# ============================================================================
+# 1. GLOBALS — усі змінні скрипта визначені один раз тут, ДО будь-якого коду,
+#    що їх використовує. Дефолти або порожні "заглушки"; реальні значення
+#    заповнюються відповідними init_*/detect_* функціями та parse_args().
+#    Це усуває клас помилок "змінна використана раніше, ніж визначена"
+#    (напр. WORKERS=$(cpu_count) викликався в оригіналі до оголошення
+#    функції cpu_count — тут такого бути не може, бо порядок жорстко
+#    контролює main()).
+# ============================================================================
+VERSION="6.2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# --- CLI-конфігуровані параметри (дефолти, можуть бути перевизначені parse_args) ---
 SIGNATURES="${SCRIPT_DIR}/signatures"
-## =============================
-# DEFAULTS
-## =============================
-WORKERS=$(cpu_count)
 ROOT_DIR="/mnt"
 MAX_SCAN_MB=10
 MAX_RAM_MB=500
@@ -46,30 +70,70 @@ DO_UPDATE=false
 USE_RAM=true
 ALLOW_BUSYBOX=true
 MB_KEY=""
-## =============================
-# DEFAULTS
-## =============================
+WORKERS=""            # порожньо = "авто", вираховується в init_workers()
 
-# ── OS / Arch ────────────────────────────────────────────────────────────────
-case "$(uname -s 2>/dev/null)" in
-    Darwin) OS="macos" ;;
-    *)      OS="linux" ;;
-esac
-ARCH="$(uname -m 2>/dev/null)"
-case "$ARCH" in
-    x86_64|amd64)   ARCH="x86_64" ;;
-    aarch64|arm64)  ARCH="arm64" ;;
-    armv7*)         ARCH="armv7" ;;
-    *)              ARCH="x86_64" ;;
-esac
+# --- Платформа (заповнює detect_platform) ---
+OS=""
+ARCH=""
 
-# ── Utilities ────────────────────────────────────────────────────────────────
+# --- Інструменти (заповнюють detect_tools / detect_sha256 / detect_md5 / detect_yara) ---
+BUSYBOX_BIN=""
+STRINGS_CMD="bash"
+FILE_CMD="bash"
+SHA256_CMD="none"
+MD5_CMD="none"
+YARA_CMD="none"
+
+# --- Робочі шляхи рантайму (заповнює init_workdir) ---
+WORK_DIR=""
+WORKER_FILE=""
+SIG_DIR=""
+
+# --- Кольори термінала (заповнює setup_colors) ---
+R=''; Y=''; G=''; C=''; B=''; Z=''
+
+# --- Стан сканування ---
+START_MS=0
+END_MS=0
+ELAPSED_S=0
+TOTAL_FILES=0
+WORKER_PIDS=()
+MONITOR_PID=""
+TF=0            # files scanned (сумарно по воркерах)
+TT=0            # threats found (сумарно по воркерах)
+SPEED=0
+RPT=""          # текст фінального звіту
+
+# ============================================================================
+# 2. MODULE: platform / cpu
+# ============================================================================
+detect_platform() {
+    case "$(uname -s 2>/dev/null)" in
+        Darwin) OS="macos" ;;
+        *)      OS="linux" ;;
+    esac
+    ARCH="$(uname -m 2>/dev/null)"
+    case "$ARCH" in
+        x86_64|amd64)   ARCH="x86_64" ;;
+        aarch64|arm64)  ARCH="arm64" ;;
+        armv7*)         ARCH="armv7" ;;
+        *)              ARCH="x86_64" ;;
+    esac
+}
+
 cpu_count() {
     command -v nproc &>/dev/null && { nproc; return; }
     command -v sysctl &>/dev/null && { sysctl -n hw.logicalcpu 2>/dev/null; return; }
     grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 4
 }
 
+now_ms() {
+    date +%s%3N 2>/dev/null || echo $(( $(date +%s) * 1000 ))
+}
+
+# ============================================================================
+# 3. MODULE: hash & yara detection
+# ============================================================================
 detect_sha256() {
     if command -v sha256sum &>/dev/null; then echo "sha256sum"
     elif command -v shasum &>/dev/null; then echo "shasum -a 256"
@@ -88,23 +152,9 @@ detect_yara() {
     command -v yara &>/dev/null && echo "yara" || echo "none"
 }
 
-# ── Work directory (RAM-disk preference) ─────────────────────────────────────
-choose_work_dir() {
-    local use_ram="$1" workers="$2"
-    if [ "$use_ram" = true ] && [ "$OS" = "linux" ] && [ -d "/dev/shm" ]; then
-        local needed=$(( workers * 12 + 60 ))
-        local avail
-        avail=$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
-        [ "${avail:-0}" -ge "$needed" ] && { echo "/dev/shm/av_scan_$$"; return; }
-    fi
-    echo "${TMPDIR:-/tmp}/av_scan_$$"
-}
-
-# ── Busybox / strings / file detection ───────────────────────────────────────
-BUSYBOX_BIN=""
-STRINGS_CMD="bash"
-FILE_CMD="bash"
-
+# ============================================================================
+# 4. MODULE: busybox / strings / file fallback
+# ============================================================================
 check_network() {
     if command -v curl &>/dev/null; then
         curl -sf --connect-timeout 3 "https://busybox.net" >/dev/null 2>&1
@@ -205,9 +255,82 @@ detect_tools() {
     echo ""
 }
 
-# =============================================================================
-# UPDATER MODULE
-# =============================================================================
+# ============================================================================
+# 5. MODULE: CLI (usage, argument parsing, colors)
+# ============================================================================
+usage() {
+    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
+    exit 0
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -u|--update)     DO_UPDATE=true; shift ;;
+            -r|--max-ram)    MAX_RAM_MB="$2"; shift 2 ;;
+            -j|--workers)    WORKERS="$2"; shift 2 ;;
+            -d|--dir)        ROOT_DIR="$2"; shift 2 ;;
+            -s|--sigs)       SIGNATURES="$2"; shift 2 ;;
+            -m|--max-size)   MAX_SCAN_MB="$2"; shift 2 ;;
+            -o|--output)     OUTPUT_FILE="$2"; shift 2 ;;
+            --no-ram)        USE_RAM=false; shift ;;
+            --no-busybox)    ALLOW_BUSYBOX=false; shift ;;
+            --mb-key)        MB_KEY="$2"; shift 2 ;;
+            -h|--help)       usage ;;
+            *) echo "Unknown parameter: $1"; exit 1 ;;
+        esac
+    done
+}
+
+setup_colors() {
+    if [ -t 1 ]; then
+        R='\033[0;31m' Y='\033[1;33m' G='\033[0;32m'
+        C='\033[0;36m' B='\033[1m' Z='\033[0m'
+    fi
+}
+
+# ============================================================================
+# 6. MODULE: worker sizing / RAM guard
+#    Замінює всі гілки логіки (кількість воркерів + RAM ceiling), які раніше
+#    були "розсипані" прямо в тілі скрипта.
+# ============================================================================
+init_workers() {
+    # WORKERS могло бути задано через -j/--workers; якщо ні — авто за CPU.
+    [ -z "$WORKERS" ] && WORKERS=$(cpu_count)
+
+    # Захист: WORKERS має бути додатним цілим (напр. -j 0 або сміттєве
+    # значення не повинні призводити до ділення на нуль пізніше в awk).
+    case "$WORKERS" in
+        ''|*[!0-9]*) WORKERS=$(cpu_count) ;;
+    esac
+    [ "${WORKERS:-0}" -ge 1 ] 2>/dev/null || WORKERS=1
+
+    echo -e "${B}[*] RAM Guard: ceiling ${C}${MAX_RAM_MB} MB${Z}"
+
+    if [ "$YARA_CMD" != "none" ] && [ -d "$SIGNATURES/yara" ]; then
+        local est_yara_mb=120
+        local max_safe=$(( MAX_RAM_MB / est_yara_mb ))
+        [ "$max_safe" -lt 1 ] && max_safe=1
+        if [ "$WORKERS" -gt "$max_safe" ]; then
+            echo -e "${Y}[WARN] YARA RAM estimate: reducing workers $WORKERS -> $max_safe${Z}"
+            WORKERS=$max_safe
+        fi
+    fi
+
+    if [ "$MAX_RAM_MB" -le 512 ]; then
+        USE_RAM=false
+        if [ "$WORKERS" -gt 4 ]; then
+            echo -e "${Y}[WARN] Low-RAM profile: workers reduced to 4${Z}"
+            WORKERS=4
+        fi
+    elif [ "$MAX_RAM_MB" -le 1024 ] && [ "$WORKERS" -gt 8 ]; then
+        WORKERS=8
+    fi
+}
+
+# ============================================================================
+# 7. MODULE: signature updater
+# ============================================================================
 update_signatures() {
     local sig_dir="$1"
     local mb_key="${2:-}"
@@ -319,87 +442,9 @@ EOF
     echo ""
 }
 
-# =============================================================================
-# DEFAULTS & ARGUMENTS
-# =============================================================================
-
-usage() {
-    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
-    exit 0
-}
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -u|--update)     DO_UPDATE=true; shift ;;
-        -r|--max-ram)    MAX_RAM_MB="$2"; shift 2 ;;
-        -j|--workers)    WORKERS="$2"; shift 2 ;;
-        -d|--dir)        ROOT_DIR="$2"; shift 2 ;;
-        -s|--sigs)       SIGNATURES="$2"; shift 2 ;;
-        -m|--max-size)   MAX_SCAN_MB="$2"; shift 2 ;;
-        -o|--output)     OUTPUT_FILE="$2"; shift 2 ;;
-        --no-ram)        USE_RAM=false; shift ;;
-        --no-busybox)    ALLOW_BUSYBOX=false; shift ;;
-        --mb-key)        MB_KEY="$2"; shift 2 ;;
-        -h|--help)       usage ;;
-        *) echo "Unknown parameter: $1"; exit 1 ;;
-    esac
-done
-
-# Colors
-if [ -t 1 ]; then
-    R='\033[0;31m' Y='\033[1;33m' G='\033[0;32m'
-    C='\033[0;36m' B='\033[1m' Z='\033[0m'
-else
-    R='' Y='' G='' C='' B='' Z=''
-fi
-
-# Update if requested
-[ "$DO_UPDATE" = true ] && update_signatures "$SIGNATURES" "$MB_KEY"
-
-# ── RAM Guard ────────────────────────────────────────────────────────────────
-echo -e "${B}[*] RAM Guard: ceiling ${C}${MAX_RAM_MB} MB${Z}"
-
-YARA_CMD=$(detect_yara)
-if [ "$YARA_CMD" != "none" ] && [ -d "$SIGNATURES/yara" ]; then
-    ESTIMATED_YARA_MB=120
-    MAX_SAFE_WORKERS=$(( MAX_RAM_MB / ESTIMATED_YARA_MB ))
-    [ "$MAX_SAFE_WORKERS" -lt 1 ] && MAX_SAFE_WORKERS=1
-    if [ "$WORKERS" -gt "$MAX_SAFE_WORKERS" ]; then
-        echo -e "${Y}[WARN] YARA RAM estimate: reducing workers $WORKERS -> $MAX_SAFE_WORKERS${Z}"
-        WORKERS=$MAX_SAFE_WORKERS
-    fi
-fi
-
-if [ "$MAX_RAM_MB" -le 512 ]; then
-    USE_RAM=false
-    if [ "$WORKERS" -gt 4 ]; then
-        echo -e "${Y}[WARN] Low-RAM profile: workers reduced to 4${Z}"
-        WORKERS=4
-    fi
-elif [ "$MAX_RAM_MB" -le 1024 ] && [ "$WORKERS" -gt 8 ]; then
-    WORKERS=8
-fi
-
-SHA256_CMD=$(detect_sha256)
-MD5_CMD=$(detect_md5)
-WORK_DIR=$(choose_work_dir "$USE_RAM" "$WORKERS")
-WORKER_FILE="$WORK_DIR/worker.sh"
-SIG_DIR="$WORK_DIR/sigs"
-mkdir -p "$WORK_DIR/reports" "$SIG_DIR"
-
-check_deps() {
-    local miss=()
-    for cmd in bash find awk grep od dd cut tr wc; do
-        command -v "$cmd" &>/dev/null || miss+=("$cmd")
-    done
-    [ ${#miss[@]} -gt 0 ] && { echo -e "${R}[FAIL] Missing: ${miss[*]}${Z}"; exit 1; }
-}
-check_deps
-detect_tools "$ALLOW_BUSYBOX"
-
-# =============================================================================
-# SIGNATURE COMPILER (v5.1 advanced + YARA)
-# =============================================================================
+# ============================================================================
+# 8. MODULE: signature compiler (v5.1 advanced + YARA)
+# ============================================================================
 compile_signatures() {
     local sig_input="$1"
     local out_dir="$2"
@@ -545,7 +590,27 @@ EOF
     echo ""
 }
 
-# ── Extract embedded worker ──────────────────────────────────────────────────
+# ============================================================================
+# 9. MODULE: workdir & worker extraction
+# ============================================================================
+choose_work_dir() {
+    local use_ram="$1" workers="$2"
+    if [ "$use_ram" = true ] && [ "$OS" = "linux" ] && [ -d "/dev/shm" ]; then
+        local needed=$(( workers * 12 + 60 ))
+        local avail
+        avail=$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
+        [ "${avail:-0}" -ge "$needed" ] && { echo "/dev/shm/av_scan_$$"; return; }
+    fi
+    echo "${TMPDIR:-/tmp}/av_scan_$$"
+}
+
+init_workdir() {
+    WORK_DIR=$(choose_work_dir "$USE_RAM" "$WORKERS")
+    WORKER_FILE="$WORK_DIR/worker.sh"
+    SIG_DIR="$WORK_DIR/sigs"
+    mkdir -p "$WORK_DIR/reports" "$SIG_DIR"
+}
+
 extract_worker() {
     local inside=false
     while IFS= read -r ln; do
@@ -556,58 +621,82 @@ extract_worker() {
     chmod +x "$WORKER_FILE"
 }
 
-extract_worker
-compile_signatures "$SIGNATURES" "$SIG_DIR"
+# ============================================================================
+# 10. MODULE: dependency check
+# ============================================================================
+check_deps() {
+    local miss=()
+    for cmd in bash find awk grep od dd cut tr wc; do
+        command -v "$cmd" &>/dev/null || miss+=("$cmd")
+    done
+    [ ${#miss[@]} -gt 0 ] && { echo -e "${R}[FAIL] Missing: ${miss[*]}${Z}"; exit 1; }
+}
 
-START_MS=$(date +%s%3N 2>/dev/null || echo $(( $(date +%s) * 1000 )))
+# ============================================================================
+# 11. MODULE: file collection & worker orchestration
+# ============================================================================
+print_banner() {
+    echo -e "${B}=================================================${Z}"
+    echo -e "${B} Oprhus AV Scanner Unified v${VERSION}${Z}  [OS: $OS | ARCH: $ARCH]"
+    echo -e " RAM Ceiling  : ${C}${MAX_RAM_MB} MB${Z}"
+    echo -e " Workers      : ${C}${WORKERS}${Z}"
+    echo -e " Target       : ${C}${ROOT_DIR}${Z}"
+    echo -e " Signatures   : ${C}${SIGNATURES}${Z}"
+    echo -e " Max size     : ${C}${MAX_SCAN_MB} MB${Z}"
+    echo -e " SHA256 / MD5 : ${C}${SHA256_CMD} / ${MD5_CMD}${Z}"
+    echo -e " YARA         : ${C}${YARA_CMD}${Z}"
+    echo -e " strings/file : ${C}${STRINGS_CMD} / ${FILE_CMD}${Z}"
+    echo -e "${B}=================================================${Z}"
+}
 
-# Banner
-echo -e "${B}=================================================${Z}"
-echo -e "${B} Oprhus AV Scanner Unified v${VERSION}${Z}  [OS: $OS | ARCH: $ARCH]"
-echo -e " RAM Ceiling  : ${C}${MAX_RAM_MB} MB${Z}"
-echo -e " Workers      : ${C}${WORKERS}${Z}"
-echo -e " Target       : ${C}${ROOT_DIR}${Z}"
-echo -e " Signatures   : ${C}${SIGNATURES}${Z}"
-echo -e " Max size     : ${C}${MAX_SCAN_MB} MB${Z}"
-echo -e " SHA256 / MD5 : ${C}${SHA256_CMD} / ${MD5_CMD}${Z}"
-echo -e " YARA         : ${C}${YARA_CMD}${Z}"
-echo -e " strings/file : ${C}${STRINGS_CMD} / ${FILE_CMD}${Z}"
-echo -e "${B}=================================================${Z}"
+collect_files() {
+    echo -e "[*] Collecting file tree..."
+    local excl=(-not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*")
+    if [ "$OS" = "linux" ] && find "$SCRIPT_DIR" -maxdepth 0 -printf "" 2>/dev/null; then
+        find "$ROOT_DIR" -type f "${excl[@]}" -printf "%s\t%m\t%p\n" 2>/dev/null > "$WORK_DIR/all_files.tsv"
+    else
+        find "$ROOT_DIR" -type f "${excl[@]}" -print 2>/dev/null > "$WORK_DIR/all_files.tsv"
+    fi
+    TOTAL_FILES=$(wc -l < "$WORK_DIR/all_files.tsv" | tr -d ' ')
+    echo -e "[*] Files queued: ${C}${TOTAL_FILES}${Z}\n"
+}
 
-# File collection
-echo -e "[*] Collecting file tree..."
-EXCL=(-not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*")
-if [ "$OS" = "linux" ] && find "$SCRIPT_DIR" -maxdepth 0 -printf "" 2>/dev/null; then
-    find "$ROOT_DIR" -type f "${EXCL[@]}" -printf "%s\t%m\t%p\n" 2>/dev/null > "$WORK_DIR/all_files.tsv"
-else
-    find "$ROOT_DIR" -type f "${EXCL[@]}" -print 2>/dev/null > "$WORK_DIR/all_files.tsv"
-fi
-TOTAL_FILES=$(wc -l < "$WORK_DIR/all_files.tsv" | tr -d ' ')
-echo -e "[*] Files queued: ${C}${TOTAL_FILES}${Z}\n"
+split_pools() {
+    awk -v w="$WORKERS" -v d="$WORK_DIR/reports" '{ print > (d "/pool_" (NR % w) ".txt") }' "$WORK_DIR/all_files.tsv"
+}
 
-awk -v w="$WORKERS" -v d="$WORK_DIR/reports" '{ print > (d "/pool_" (NR % w) ".txt") }' "$WORK_DIR/all_files.tsv"
+launch_workers() {
+    echo -e "[*] Launching ${WORKERS} workers (batch hash + YARA)...\n"
+    WORKER_PIDS=()
+    local pool wid
+    for pool in "$WORK_DIR/reports"/pool_*.txt; do
+        [ -f "$pool" ] || continue
+        wid=$(basename "$pool" .txt)
+        bash "$WORKER_FILE" \
+            "$pool" "$wid" "$WORK_DIR/reports" \
+            "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
+            "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" &
+        WORKER_PIDS+=($!)
+    done
+}
 
-# Launch workers
-echo -e "[*] Launching ${WORKERS} workers (batch hash + YARA)...\n"
-WORKER_PIDS=()
-for pool in "$WORK_DIR/reports"/pool_*.txt; do
-    [ -f "$pool" ] || continue
-    wid=$(basename "$pool" .txt)
-    bash "$WORKER_FILE" \
-        "$pool" "$wid" "$WORK_DIR/reports" \
-        "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
-        "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" &
-    WORKER_PIDS+=($!)
-done
+wait_for_workers() {
+    local pid
+    for pid in "${WORKER_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    kill "$MONITOR_PID" 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
+}
 
-# ── Live Progress Monitor (from v5.1) ────────────────────────────────────────
+# ============================================================================
+# 12. MODULE: progress monitor / cleanup
+# ============================================================================
 show_progress() {
     local prev=0 prev_ms="$START_MS"
     tput civis 2>/dev/null || true
     printf '\n\n\n\n\n'
     while true; do
         local now elapsed_ms elapsed_s
-        now=$(date +%s%3N 2>/dev/null || echo $(( $(date +%s) * 1000 )))
+        now=$(now_ms)
         elapsed_ms=$(( now - START_MS )); elapsed_s=$(( elapsed_ms / 1000 ))
 
         local tf=0 tt=0
@@ -666,38 +755,37 @@ show_progress() {
     done
 }
 
-show_progress &
-MONITOR_PID=$!
+start_monitor() {
+    show_progress &
+    MONITOR_PID=$!
+}
 
 cleanup() {
     kill "$MONITOR_PID" 2>/dev/null || true
+    local p
     for p in "${WORKER_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
     tput cnorm 2>/dev/null || true
     rm -rf "$WORK_DIR"
     echo -e "\n${Y}[WARN] Scan aborted${Z}"
     exit 130
 }
-trap cleanup INT TERM
 
-# Wait
-for pid in "${WORKER_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
-kill "$MONITOR_PID" 2>/dev/null || true
-tput cnorm 2>/dev/null || true
+# ============================================================================
+# 13. MODULE: reporting
+# ============================================================================
+build_report() {
+    ELAPSED_S=$(( (END_MS - START_MS) / 1000 ))
+    TF=0; TT=0
+    local r f t
+    for r in "$WORK_DIR/reports"/pool_*.txt; do
+        [ -f "$r" ] || continue
+        f=$(grep "^FILES_SCANNED:" "$r" 2>/dev/null | cut -d: -f2)
+        t=$(grep "^THREATS_FOUND:" "$r" 2>/dev/null | cut -d: -f2)
+        TF=$(( TF + ${f:-0} )); TT=$(( TT + ${t:-0} ))
+    done
+    SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
 
-# Final report
-END_MS=$(date +%s%3N 2>/dev/null || echo $(( $(date +%s) * 1000 )))
-ELAPSED_S=$(( (END_MS - START_MS) / 1000 ))
-
-TF=0; TT=0
-for r in "$WORK_DIR/reports"/pool_*.txt; do
-    [ -f "$r" ] || continue
-    f=$(grep "^FILES_SCANNED:" "$r" 2>/dev/null | cut -d: -f2)
-    t=$(grep "^THREATS_FOUND:" "$r" 2>/dev/null | cut -d: -f2)
-    TF=$(( TF + ${f:-0} )); TT=$(( TT + ${t:-0} ))
-done
-SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
-
-RPT="
+    RPT="
 =================================================
  SCAN RESULTS  (Oprhus Unified v${VERSION})
 =================================================
@@ -709,22 +797,26 @@ RPT="
  Avg Speed          : ${SPEED} files/s
  Workers            : $WORKERS
 ================================================="
+}
 
-echo -e "\n"
-if [ "$TT" -gt 0 ]; then
-    echo -e "${R}${RPT}${Z}"
-    echo -e "\n${R}${B}=== DETECTED THREATS ===${Z}"
-    grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null \
-        | cut -d: -f2- | sort -u \
-        | while IFS='|' read -r type file info; do
-            echo -e " ${R}[!]${Z} [${Y}${type}${Z}] ${file} ${C}${info:-}${Z}"
-          done
-else
-    echo -e "${G}${RPT}${Z}"
-    echo -e "\n ${G}[OK] No threats detected [CLEAN]${Z}"
-fi
+print_report() {
+    echo -e "\n"
+    if [ "$TT" -gt 0 ]; then
+        echo -e "${R}${RPT}${Z}"
+        echo -e "\n${R}${B}=== DETECTED THREATS ===${Z}"
+        grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null \
+            | cut -d: -f2- | sort -u \
+            | while IFS='|' read -r type file info; do
+                echo -e " ${R}[!]${Z} [${Y}${type}${Z}] ${file} ${C}${info:-}${Z}"
+              done
+    else
+        echo -e "${G}${RPT}${Z}"
+        echo -e "\n ${G}[OK] No threats detected [CLEAN]${Z}"
+    fi
+}
 
-[ -n "$OUTPUT_FILE" ] && {
+save_report() {
+    [ -n "$OUTPUT_FILE" ] || return 0
     {
         echo "$RPT"
         [ "$TT" -gt 0 ] && {
@@ -735,17 +827,66 @@ fi
     echo -e "\n[*] Report saved: ${C}${OUTPUT_FILE}${Z}"
 }
 
-rm -rf "$WORK_DIR"
-exit 0
+# ============================================================================
+# 14. main() — єдина точка входу; жорстко фіксує порядок ініціалізації, тож
+#     жоден модуль ніколи не викликається раніше, ніж заповнені потрібні йому
+#     глобальні змінні.
+# ============================================================================
+main() {
+    detect_platform
+    parse_args "$@"
+    setup_colors
+
+    [ "$DO_UPDATE" = true ] && update_signatures "$SIGNATURES" "$MB_KEY"
+
+    YARA_CMD=$(detect_yara)
+    init_workers
+
+    SHA256_CMD=$(detect_sha256)
+    MD5_CMD=$(detect_md5)
+
+    init_workdir
+    check_deps
+    detect_tools "$ALLOW_BUSYBOX"
+
+    extract_worker
+    compile_signatures "$SIGNATURES" "$SIG_DIR"
+
+    START_MS=$(now_ms)
+    print_banner
+
+    collect_files
+    split_pools
+    launch_workers
+
+    start_monitor
+    trap cleanup INT TERM
+
+    wait_for_workers
+
+    END_MS=$(now_ms)
+    build_report
+    print_report
+    save_report
+
+    rm -rf "$WORK_DIR"
+    exit 0
+}
+
+main "$@"
 
 # =============================================================================
-# EMBEDDED WORKER (best of v5.1 + v6.0)
+# 15. EMBEDDED WORKER (self-contained, теж модульний)
 # =============================================================================
 #__WORKER_START__
 #!/bin/bash
 set -uo pipefail
 export LC_ALL=C
 
+# ----------------------------------------------------------------------------
+# GLOBALS — усі змінні воркера визначені один раз тут, ДО функцій, що їх
+# використовують.
+# ----------------------------------------------------------------------------
 POOL_FILE="${1:?}"
 WORKER_ID="${2:?}"
 REPORT_DIR="${3:?}"
@@ -772,18 +913,33 @@ HAS_HEX_ERE=false
 HAS_YARA=false
 YARA_TARGET=""
 
-[ -s "$SIG_DIR/sha256.tsv" ] && HAS_SHA256=true
-[ -s "$SIG_DIR/md5.tsv" ] && HAS_MD5=true
-[ -s "$SIG_DIR/b64_payloads.tsv" ] && HAS_B64=true
-[ -s "$SIG_DIR/strings.txt" ] && HAS_STRINGS=true
-[ -s "$SIG_DIR/hex_ere.txt" ] && HAS_HEX_ERE=true
+declare -a BATCH_SHA=()
+declare -a BATCH_MD5=()
+declare -a BATCH_YARA=()
+SHA_BATCH_CNT=0
+MD5_BATCH_CNT=0
+YARA_BATCH_CNT=0
 
-if [ -f "$SIG_DIR/yara/rules.yarc" ]; then
-    HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/rules.yarc"
-elif [ -f "$SIG_DIR/yara/index.yar" ]; then
-    HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/index.yar"
-fi
+# ----------------------------------------------------------------------------
+# MODULE: init
+# ----------------------------------------------------------------------------
+init_worker_state() {
+    [ -s "$SIG_DIR/sha256.tsv" ] && HAS_SHA256=true
+    [ -s "$SIG_DIR/md5.tsv" ] && HAS_MD5=true
+    [ -s "$SIG_DIR/b64_payloads.tsv" ] && HAS_B64=true
+    [ -s "$SIG_DIR/strings.txt" ] && HAS_STRINGS=true
+    [ -s "$SIG_DIR/hex_ere.txt" ] && HAS_HEX_ERE=true
 
+    if [ -f "$SIG_DIR/yara/rules.yarc" ]; then
+        HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/rules.yarc"
+    elif [ -f "$SIG_DIR/yara/index.yar" ]; then
+        HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/index.yar"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# MODULE: low-level helpers (stat / hash / decode / strings / file-type)
+# ----------------------------------------------------------------------------
 _stat_size() {
     if [ "$OS" = "macos" ]; then stat -f '%z' "$1" 2>/dev/null
     else stat -c '%s' "$1" 2>/dev/null; fi
@@ -876,6 +1032,9 @@ do_file_type() {
     fi
 }
 
+# ----------------------------------------------------------------------------
+# MODULE: logging
+# ----------------------------------------------------------------------------
 log() { printf '[%s] %s\n' "$WORKER_ID" "$*" >> "$REPORT"; }
 threat() { printf 'THREAT:%s\n' "$*" >> "$REPORT"; THREATS_FOUND=$(( THREATS_FOUND + 1 )); }
 progress() {
@@ -883,7 +1042,9 @@ progress() {
         "$FILES_SCANNED" "$THREATS_FOUND" "${1:-}" > "$PROGRESS"
 }
 
-# Batch hash
+# ----------------------------------------------------------------------------
+# MODULE: hash matching
+# ----------------------------------------------------------------------------
 process_hash_batch() {
     local htype="$1" sig_file="$2"
     shift 2
@@ -896,8 +1057,12 @@ process_hash_batch() {
     out=$($cmd "$@" 2>/dev/null)
     [ -z "$out" ] && return
 
+    # ФІКС: "grep -F -f - sig_file" повертає ПОВНІ рядки бази (hash<TAB>name),
+    # а не самі хеші. Без завершального "cut -f1" наступний grep "^$hit_hash"
+    # порівнював рядок з рядком і ніколи нічого не знаходив — виявлення
+    # відомого малваре за хешем не працювало. Тепер hits містить чисті хеші.
     local hits
-    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | grep -F -f - "$sig_file" 2>/dev/null)
+    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | grep -F -f - "$sig_file" 2>/dev/null | cut -f1)
     if [ -n "$hits" ]; then
         while IFS= read -r hit_hash; do
             [ -z "$hit_hash" ] && continue
@@ -910,7 +1075,9 @@ process_hash_batch() {
     fi
 }
 
-# YARA batch
+# ----------------------------------------------------------------------------
+# MODULE: yara matching
+# ----------------------------------------------------------------------------
 process_yara_batch() {
     [ $# -eq 0 ] || [ "$HAS_YARA" = false ] || [ "$YARA_CMD" = "none" ] && return
     local yara_out
@@ -925,7 +1092,9 @@ process_yara_batch() {
     fi
 }
 
-# Heuristics (v5.1)
+# ----------------------------------------------------------------------------
+# MODULE: heuristics
+# ----------------------------------------------------------------------------
 check_file_heuristics() {
     local file="$1" size="$2" oct="$3"
 
@@ -990,99 +1159,126 @@ check_file_heuristics() {
     esac
 
     # Permissions
+    # ФІКС: stat/find зазвичай повертають 3-значний октальний режим ("644"),
+    # без setuid/setgid-біта. "${oct: -4}" на рядку коротшому за 4 символи
+    # в bash повертає ПОРОЖНІЙ рядок (від'ємний офсет виходить за межі), тому
+    # 8#$oct ставав "8#" -> "invalid integer constant", і перевірка
+    # SUID/SGID/world-writable мовчки ламалась на кожному файлі. Тепер
+    # спочатку доповнюємо нулями зліва до 4 символів, і лише потім беремо
+    # останні 4.
     if [ -n "$oct" ] && [ "$oct" != "0" ]; then
+        oct="0000${oct}"
         oct="${oct: -4}"
         (( 8#$oct & 8#6000 )) 2>/dev/null && threat "SUID_SGID|$file|perms=$oct"
-        (( 8#$oct & 8#0002 )) && (( 8#$oct & 8#0111 )) 2>/dev/null && threat "WORLD_WRITABLE_EXEC|$file|perms=$oct"
+        (( 8#$oct & 8#0002 )) 2>/dev/null && (( 8#$oct & 8#0111 )) 2>/dev/null && threat "WORLD_WRITABLE_EXEC|$file|perms=$oct"
     fi
 }
 
-# Main loop
-log "Worker started PID=$$ OS=$OS yara=$YARA_CMD"
-progress "init"
+# ----------------------------------------------------------------------------
+# MODULE: scan loop
+# ФІКС: увесь цикл тепер живе всередині функції run_scan_loop(), а не на
+# верхньому рівні файлу. Раніше "local file size oct" стояло поза функцією,
+# що в bash — помилка ("local: can only be used in a function") на кожній
+# ітерації. Тепер local-змінні коректні й справді ізольовані від глобального
+# простору імен.
+# ----------------------------------------------------------------------------
+run_scan_loop() {
+    local col1 col2 col3 file size oct magic_type skip_deep ext
 
-declare -a BATCH_SHA=()
-declare -a BATCH_MD5=()
-declare -a BATCH_YARA=()
-SHA_BATCH_CNT=0
-MD5_BATCH_CNT=0
-YARA_BATCH_CNT=0
+    while IFS=$'\t' read -r col1 col2 col3; do
+        file=""; size=""; oct=""
+        if [ -n "${col3:-}" ]; then
+            size="$col1"; oct="$col2"; file="$col3"
+        else
+            file="$col1"
+            [ -z "$file" ] || [ ! -f "$file" ] || [ ! -r "$file" ] && continue
+            size=$(_stat_size "$file") || continue
+            oct=$(_stat_mode "$file")
+        fi
 
-while IFS=$'\t' read -r col1 col2 col3; do
-    local file size oct
-    if [ -n "${col3:-}" ]; then
-        size="$col1"; oct="$col2"; file="$col3"
-    else
-        file="$col1"
         [ -z "$file" ] || [ ! -f "$file" ] || [ ! -r "$file" ] && continue
-        size=$(_stat_size "$file") || continue
-        oct=$(_stat_mode "$file")
-    fi
+        FILES_SCANNED=$(( FILES_SCANNED + 1 ))
+        [ "$size" -eq 0 ] && continue
 
-    [ -z "$file" ] || [ ! -f "$file" ] || [ ! -r "$file" ] && continue
-    FILES_SCANNED=$(( FILES_SCANNED + 1 ))
-    [ "$size" -eq 0 ] && continue
-
-    if [ "$size" -lt "$MAX_SIZE" ]; then
-        # Hash batches
-        if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
-            BATCH_SHA+=("$file")
-            SHA_BATCH_CNT=$(( SHA_BATCH_CNT + 1 ))
-            if [ "$SHA_BATCH_CNT" -ge 50 ]; then
-                process_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
-                BATCH_SHA=(); SHA_BATCH_CNT=0
-            fi
-        fi
-        if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
-            BATCH_MD5+=("$file")
-            MD5_BATCH_CNT=$(( MD5_BATCH_CNT + 1 ))
-            if [ "$MD5_BATCH_CNT" -ge 50 ]; then
-                process_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
-                BATCH_MD5=(); MD5_BATCH_CNT=0
-            fi
-        fi
-
-        # Magic filter + YARA decision
-        local magic_type skip_deep=false
-        magic_type=$(_bash_file_type "$file")
-        case "$magic_type" in
-            JPEG|PNG|GIF) skip_deep=true ;;
-        esac
-
-        # Disguised override
-        local ext="${file##*.}"
-        case "${ext,,}" in
-            jpg|jpeg|png|gif)
-                if [ "$magic_type" = "ELF" ] || [ "$magic_type" = "PE_MZ" ]; then
-                    threat "DISGUISED_FILE|$file|ext=.$ext|real=$magic_type"
-                    skip_deep=false
+        if [ "$size" -lt "$MAX_SIZE" ]; then
+            # Hash batches
+            if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
+                BATCH_SHA+=("$file")
+                SHA_BATCH_CNT=$(( SHA_BATCH_CNT + 1 ))
+                if [ "$SHA_BATCH_CNT" -ge 50 ]; then
+                    process_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
+                    BATCH_SHA=(); SHA_BATCH_CNT=0
                 fi
-                ;;
-        esac
+            fi
+            if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
+                BATCH_MD5+=("$file")
+                MD5_BATCH_CNT=$(( MD5_BATCH_CNT + 1 ))
+                if [ "$MD5_BATCH_CNT" -ge 50 ]; then
+                    process_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
+                    BATCH_MD5=(); MD5_BATCH_CNT=0
+                fi
+            fi
 
-        if [ "$skip_deep" = false ] && [ "$HAS_YARA" = true ]; then
-            BATCH_YARA+=("$file")
-            YARA_BATCH_CNT=$(( YARA_BATCH_CNT + 1 ))
-            if [ "$YARA_BATCH_CNT" -ge 50 ]; then
-                process_yara_batch "${BATCH_YARA[@]}"
-                BATCH_YARA=(); YARA_BATCH_CNT=0
+            # Magic filter + YARA decision
+            magic_type=$(_bash_file_type "$file")
+            skip_deep=false
+            case "$magic_type" in
+                JPEG|PNG|GIF) skip_deep=true ;;
+            esac
+
+            # Disguised override
+            ext="${file##*.}"
+            case "${ext,,}" in
+                jpg|jpeg|png|gif)
+                    if [ "$magic_type" = "ELF" ] || [ "$magic_type" = "PE_MZ" ]; then
+                        threat "DISGUISED_FILE|$file|ext=.$ext|real=$magic_type"
+                        skip_deep=false
+                    fi
+                    ;;
+            esac
+
+            if [ "$skip_deep" = false ] && [ "$HAS_YARA" = true ]; then
+                BATCH_YARA+=("$file")
+                YARA_BATCH_CNT=$(( YARA_BATCH_CNT + 1 ))
+                if [ "$YARA_BATCH_CNT" -ge 50 ]; then
+                    process_yara_batch "${BATCH_YARA[@]}"
+                    BATCH_YARA=(); YARA_BATCH_CNT=0
+                fi
             fi
         fi
-    fi
 
-    # Full heuristics
-    check_file_heuristics "$file" "$size" "${oct:-0}"
+        # Full heuristics
+        check_file_heuristics "$file" "$size" "${oct:-0}"
 
-    [ $(( FILES_SCANNED % 50 )) -eq 0 ] && progress "$file"
-done < "$POOL_FILE"
+        [ $(( FILES_SCANNED % 50 )) -eq 0 ] && progress "$file"
+    done < "$POOL_FILE"
 
-# Flush
-[ "$SHA_BATCH_CNT" -gt 0 ] && process_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
-[ "$MD5_BATCH_CNT" -gt 0 ] && process_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
-[ "$YARA_BATCH_CNT" -gt 0 ] && process_yara_batch "${BATCH_YARA[@]}"
+    # Flush залишків батчів
+    [ "$SHA_BATCH_CNT" -gt 0 ] && process_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
+    [ "$MD5_BATCH_CNT" -gt 0 ] && process_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
+    [ "$YARA_BATCH_CNT" -gt 0 ] && process_yara_batch "${BATCH_YARA[@]}"
+}
 
-progress "done"
-printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" >> "$REPORT"
-log "Completed - files: $FILES_SCANNED, threats: $THREATS_FOUND"
-touch "${REPORT_DIR}/${WORKER_ID}.done"
+# ----------------------------------------------------------------------------
+# MODULE: finalize
+# ----------------------------------------------------------------------------
+finalize_worker() {
+    progress "done"
+    printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" >> "$REPORT"
+    log "Completed - files: $FILES_SCANNED, threats: $THREATS_FOUND"
+    touch "${REPORT_DIR}/${WORKER_ID}.done"
+}
+
+# ----------------------------------------------------------------------------
+# main() воркера
+# ----------------------------------------------------------------------------
+main() {
+    log "Worker started PID=$$ OS=$OS yara=$YARA_CMD"
+    progress "init"
+    init_worker_state
+    run_scan_loop
+    finalize_worker
+}
+
+main "$@"
 #__WORKER_END__
