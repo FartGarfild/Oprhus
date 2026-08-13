@@ -1,32 +1,42 @@
 #!/bin/bash
 # =============================================================================
-# Oprhus AV Scanner Unified v6.2 (modular)
-# Best of v5.1 + v6.0 + Signature Updater
-#
+# Oprhus AV Scanner Unified v6.3 (modular + quarantine + real-time)
 # Features:
 #   - Built-in signature updater (Maldet, ClamAV, YARA, MalwareBazaar, custom)
 #   - Parallel workers with batch hashing (SHA256 + MD5) and YARA batching
 #   - Zero-RAM lookup + strict RAM ceiling
-#   - Real-time RAM / CPU / ETA / FPS monitor
+#   - Real-time RAM / CPU / ETA / FPS monitor (progress UI, не плутати з
+#     режимом --real-time нижче)
 #   - Full heuristics: strings, hex-ERE, b64 payloads, disguised files, SUID/SGID
 #   - Magic-bytes fast filter + busybox fallback
+#   - Quarantine mode: перенесення виявлених файлів в ізольовану директорію
+#   - Real-time watch mode: фоновий демон, що індексує дерево файлів і
+#     автоматично сканує щойно створені файли
 #   - Pure self-contained single file
 #
 # Usage:
 #   ./av_scan.sh [OPTIONS]
 #
 # Options:
-#   -u, --update          Update all signatures before scanning
-#   -r, --max-ram MB      Max RAM limit in megabytes (default: 500)
-#   -j, --workers N       Number of parallel worker processes (default: auto)
-#   -d, --dir PATH        Target directory to scan (default: /mnt)
-#   -s, --sigs PATH       Signature directory (default: ./signatures)
-#   -m, --max-size MB     Max file size for deep inspection in MB (default: 10)
-#   -o, --output FILE     Save final report to file
-#   --no-ram              Force /tmp instead of /dev/shm
-#   --no-busybox          Do not offer busybox download
-#   --mb-key KEY          MalwareBazaar Auth-Key (optional)
-#   -h, --help            Show this help
+#   -u, --update            Update all signatures before scanning
+#   -r, --max-ram MB        Max RAM limit in megabytes (default: 500)
+#   -j, --workers N         Number of parallel worker processes (default: auto)
+#   -d, --dir PATH          Target directory to scan (default: /mnt)
+#   -s, --sigs PATH         Signature directory (default: ./signatures)
+#   -m, --max-size MB       Max file size for deep inspection in MB (default: 10)
+#   -o, --output FILE       Save final report to file
+#   --no-ram                Force /tmp instead of /dev/shm
+#   --no-busybox            Do not offer busybox download
+#   --mb-key KEY            MalwareBazaar Auth-Key (optional)
+#   -q, --quarantine        Enable quarantine mode (default dir: ./quarantine)
+#   --quarantine-dir PATH   Enable quarantine mode with a custom directory
+#   --quarantine-perm MODE  chmod-режим для карантинних файлів (default: 0400,
+#                            тобто лише читання, без запуску)
+#   -w, --real-time         Після базового скану перейти в режим фонового
+#                            моніторингу: новостворені файли перевіряються
+#                            автоматично (inotifywait, або polling як фолбек)
+#   --watch-interval SEC    Інтервал опитування для polling-фолбеку (default: 5)
+#   -h, --help               Show this help
 #
 # ── Структура файлу ──────────────────────────────────────────────────────────
 #   1. GLOBALS         — усі змінні скрипта, визначені один раз тут
@@ -35,15 +45,18 @@
 #   4. MODULE: busybox / strings / file fallback
 #   5. MODULE: CLI (usage, parse_args, colors)
 #   6. MODULE: worker sizing / RAM guard
-#   7. MODULE: signature updater
-#   8. MODULE: signature compiler
-#   9. MODULE: workdir & worker extraction
-#  10. MODULE: dependency check
-#  11. MODULE: file collection & worker orchestration
-#  12. MODULE: progress monitor / cleanup
-#  13. MODULE: reporting
-#  14. main()          — єдина точка, що викликає модулі в потрібному порядку
-#  15. EMBEDDED WORKER  — окремий self-contained скрипт (теж модульний)
+#   7. MODULE: quarantine (ініціалізація на боці головного скрипта)
+#   8. MODULE: signature updater
+#   9. MODULE: signature compiler
+#  10. MODULE: workdir & worker extraction
+#  11. MODULE: dependency check
+#  12. MODULE: file collection & worker orchestration
+#  13. MODULE: progress monitor / cleanup
+#  14. MODULE: reporting
+#  15. MODULE: real-time watch (фоновий демон)
+#  16. main()          — єдина точка, що викликає модулі в потрібному порядку
+#  17. EMBEDDED WORKER  — окремий self-contained скрипт (теж модульний;
+#                          містить і сканування, і фактичний карантин)
 # =============================================================================
 set -uo pipefail
 export LC_ALL=C
@@ -71,6 +84,22 @@ USE_RAM=true
 ALLOW_BUSYBOX=true
 MB_KEY=""
 WORKERS=""            # порожньо = "авто", вираховується в init_workers()
+
+# --- Карантин ---
+QUARANTINE_ENABLED=false
+QUARANTINE_DIR="${SCRIPT_DIR}/quarantine"
+QUARANTINE_PERM="0400"   # read-only, без виконання (НЕ буквальне "100" —
+                          # 100 у chmod означає --x------, тобто "лише
+                          # виконання", протилежне до "тільки читання без
+                          # запуску"; 0400 = r-------- це і є той режим)
+
+# --- Real-time watch (фоновий демон) ---
+REALTIME_MODE=false
+WATCH_INTERVAL=5
+REALTIME_FIFO=""
+REALTIME_WORKER_PID=""
+REALTIME_REPORT=""
+REALTIME_TAIL_PID=""
 
 # --- Платформа (заповнює detect_platform) ---
 OS=""
@@ -101,6 +130,7 @@ WORKER_PIDS=()
 MONITOR_PID=""
 TF=0            # files scanned (сумарно по воркерах)
 TT=0            # threats found (сумарно по воркерах)
+QC=0            # quarantined (сумарно по воркерах)
 SPEED=0
 RPT=""          # текст фінального звіту
 
@@ -276,6 +306,11 @@ parse_args() {
             --no-ram)        USE_RAM=false; shift ;;
             --no-busybox)    ALLOW_BUSYBOX=false; shift ;;
             --mb-key)        MB_KEY="$2"; shift 2 ;;
+            -q|--quarantine) QUARANTINE_ENABLED=true; shift ;;
+            --quarantine-dir)  QUARANTINE_ENABLED=true; QUARANTINE_DIR="$2"; shift 2 ;;
+            --quarantine-perm) QUARANTINE_PERM="$2"; shift 2 ;;
+            -w|--real-time|--realtime) REALTIME_MODE=true; shift ;;
+            --watch-interval)  WATCH_INTERVAL="$2"; shift 2 ;;
             -h|--help)       usage ;;
             *) echo "Unknown parameter: $1"; exit 1 ;;
         esac
@@ -329,7 +364,35 @@ init_workers() {
 }
 
 # ============================================================================
-# 7. MODULE: signature updater
+# 7. MODULE: quarantine (ініціалізація на боці головного скрипта)
+#    Фактичне перенесення файлу відбувається у воркері (EMBEDDED WORKER,
+#    функція quarantine_file) — саме там, де файл детектується, щоб не було
+#    затримки/гонитви між моментом виявлення і моментом ізоляції.
+# ============================================================================
+init_quarantine() {
+    [ "$QUARANTINE_ENABLED" = true ] || return 0
+
+    mkdir -p "$QUARANTINE_DIR" 2>/dev/null
+    chmod 700 "$QUARANTINE_DIR" 2>/dev/null
+
+    # Попередження: якщо карантин лежить всередині цілі сканування, карантинні
+    # файли можуть потрапити в наступний прохід сканера (або в real-time watch)
+    # і будуть повторно позначені/оброблені.
+    case "$QUARANTINE_DIR" in
+        "$ROOT_DIR"/*|"$ROOT_DIR")
+            echo -e "${Y}[WARN] Карантинна директорія всередині цілі сканування ($ROOT_DIR) — можливе повторне сканування карантинних файлів${Z}"
+            ;;
+    esac
+
+    echo -e "${C}[*] Quarantine: ${QUARANTINE_DIR} (perm ${QUARANTINE_PERM})${Z}"
+}
+
+count_quarantined() {
+    grep -h "QUARANTINED:" "$WORK_DIR/reports"/*.txt 2>/dev/null | wc -l | tr -d ' '
+}
+
+# ============================================================================
+# 8. MODULE: signature updater
 # ============================================================================
 update_signatures() {
     local sig_dir="$1"
@@ -443,7 +506,7 @@ EOF
 }
 
 # ============================================================================
-# 8. MODULE: signature compiler (v5.1 advanced + YARA)
+# 9. MODULE: signature compiler (v5.1 advanced + YARA)
 # ============================================================================
 compile_signatures() {
     local sig_input="$1"
@@ -591,7 +654,7 @@ EOF
 }
 
 # ============================================================================
-# 9. MODULE: workdir & worker extraction
+# 10. MODULE: workdir & worker extraction
 # ============================================================================
 choose_work_dir() {
     local use_ram="$1" workers="$2"
@@ -622,7 +685,7 @@ extract_worker() {
 }
 
 # ============================================================================
-# 10. MODULE: dependency check
+# 11. MODULE: dependency check
 # ============================================================================
 check_deps() {
     local miss=()
@@ -633,7 +696,7 @@ check_deps() {
 }
 
 # ============================================================================
-# 11. MODULE: file collection & worker orchestration
+# 12. MODULE: file collection & worker orchestration
 # ============================================================================
 print_banner() {
     echo -e "${B}=================================================${Z}"
@@ -646,6 +709,14 @@ print_banner() {
     echo -e " SHA256 / MD5 : ${C}${SHA256_CMD} / ${MD5_CMD}${Z}"
     echo -e " YARA         : ${C}${YARA_CMD}${Z}"
     echo -e " strings/file : ${C}${STRINGS_CMD} / ${FILE_CMD}${Z}"
+    if [ "$QUARANTINE_ENABLED" = true ]; then
+        echo -e " Quarantine   : ${C}ON -> ${QUARANTINE_DIR} (perm ${QUARANTINE_PERM})${Z}"
+    else
+        echo -e " Quarantine   : off"
+    fi
+    if [ "$REALTIME_MODE" = true ]; then
+        echo -e " Real-time    : ${C}ON${Z} (стартує після базового скану)"
+    fi
     echo -e "${B}=================================================${Z}"
 }
 
@@ -668,14 +739,16 @@ split_pools() {
 launch_workers() {
     echo -e "[*] Launching ${WORKERS} workers (batch hash + YARA)...\n"
     WORKER_PIDS=()
-    local pool wid
+    local pool wid qdir=""
+    [ "$QUARANTINE_ENABLED" = true ] && qdir="$QUARANTINE_DIR"
     for pool in "$WORK_DIR/reports"/pool_*.txt; do
         [ -f "$pool" ] || continue
         wid=$(basename "$pool" .txt)
         bash "$WORKER_FILE" \
             "$pool" "$wid" "$WORK_DIR/reports" \
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
-            "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" &
+            "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
+            "$qdir" "$QUARANTINE_PERM" &
         WORKER_PIDS+=($!)
     done
 }
@@ -688,7 +761,7 @@ wait_for_workers() {
 }
 
 # ============================================================================
-# 12. MODULE: progress monitor / cleanup
+# 13. MODULE: progress monitor / cleanup
 # ============================================================================
 show_progress() {
     local prev=0 prev_ms="$START_MS"
@@ -764,6 +837,7 @@ cleanup() {
     kill "$MONITOR_PID" 2>/dev/null || true
     local p
     for p in "${WORKER_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    cleanup_realtime
     tput cnorm 2>/dev/null || true
     rm -rf "$WORK_DIR"
     echo -e "\n${Y}[WARN] Scan aborted${Z}"
@@ -771,7 +845,7 @@ cleanup() {
 }
 
 # ============================================================================
-# 13. MODULE: reporting
+# 14. MODULE: reporting
 # ============================================================================
 build_report() {
     ELAPSED_S=$(( (END_MS - START_MS) / 1000 ))
@@ -785,6 +859,12 @@ build_report() {
     done
     SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
 
+    QC=0
+    [ "$QUARANTINE_ENABLED" = true ] && QC=$(count_quarantined)
+    local quarantine_line=""
+    [ "$QUARANTINE_ENABLED" = true ] && quarantine_line="
+ Quarantined        : $QC ($QUARANTINE_DIR)"
+
     RPT="
 =================================================
  SCAN RESULTS  (Oprhus Unified v${VERSION})
@@ -792,7 +872,7 @@ build_report() {
  OS / Arch          : $OS / $ARCH
  Target             : $ROOT_DIR
  Files Scanned      : $TF
- Threats Found      : $TT
+ Threats Found      : $TT${quarantine_line}
  Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
  Avg Speed          : ${SPEED} files/s
  Workers            : $WORKERS
@@ -828,7 +908,117 @@ save_report() {
 }
 
 # ============================================================================
-# 14. main() — єдина точка входу; жорстко фіксує порядок ініціалізації, тож
+# 15. MODULE: real-time watch (фоновий демон)
+#
+#     Ідея: замість дублювання логіки сканування, запускаємо ОДИН екземпляр
+#     того ж самого воркера (той самий файл WORKER_FILE, ті ж функції
+#     хешування/YARA/евристик/карантину), але замість статичного pool-файлу
+#     він читає шляхи з іменованого каналу (FIFO). "while read ... done < FIFO"
+#     у воркері автоматично блокується й чекає нових рядків — тобто воркер
+#     сам по собі вже є "нескінченним" процесом реального часу, нічого
+#     додатково писати в ньому не треба.
+#
+#     Головний скрипт лише постачає шляхи до нових файлів у FIFO:
+#       - якщо є inotifywait -> миттєво, по подіях файлової системи
+#       - інакше -> періодичний polling (find + порівняння з попереднім
+#         знімком) кожні WATCH_INTERVAL секунд
+# ============================================================================
+start_realtime_worker() {
+    REALTIME_FIFO="$WORK_DIR/realtime.fifo"
+    mkfifo "$REALTIME_FIFO" 2>/dev/null || {
+        echo -e "${R}[FAIL] Не вдалося створити FIFO для real-time режиму${Z}"
+        return 1
+    }
+
+    local qdir=""
+    [ "$QUARANTINE_ENABLED" = true ] && qdir="$QUARANTINE_DIR"
+
+    REALTIME_REPORT="$WORK_DIR/reports/rt.txt"
+    : > "$REALTIME_REPORT"
+
+    # Воркер відкриє FIFO на читання і забльокується всередині свого звичного
+    # run_scan_loop(), очікуючи нові рядки-шляхи.
+    bash "$WORKER_FILE" \
+        "$REALTIME_FIFO" "rt" "$WORK_DIR/reports" \
+        "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
+        "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
+        "$qdir" "$QUARANTINE_PERM" &
+    REALTIME_WORKER_PID=$!
+
+    # Тримаємо дескриптор на запис відкритим постійно (fd 3). Якщо відкривати
+    # FIFO на запис окремо для кожного нового файлу, кожен виклик блокуватиме
+    # до появи читача і зашумлятиме логіку — набагато простіше й надійніше
+    # тримати один довгоживучий канал запису.
+    exec 3> "$REALTIME_FIFO"
+}
+
+feed_realtime_path() {
+    local path="$1"
+    [ -f "$path" ] || return 0
+    printf '%s\n' "$path" >&3 2>/dev/null || true
+}
+
+# Виводить нові THREAT-рядки з живого звіту воркера прямо в консоль
+tail_realtime_report() {
+    tail -n0 -F "$REALTIME_REPORT" 2>/dev/null | while IFS= read -r line; do
+        case "$line" in
+            THREAT:*)
+                echo -e "${R}${B}[RT-THREAT]${Z} ${line#THREAT:}"
+                ;;
+        esac
+    done &
+    REALTIME_TAIL_PID=$!
+}
+
+watch_inotify() {
+    echo -e "${C}[*] Real-time: використовую inotifywait (миттєва реакція)${Z}"
+    inotifywait -m -r -e create -e moved_to -e close_write \
+        --format '%w%f' "$ROOT_DIR" 2>/dev/null | while IFS= read -r path; do
+        feed_realtime_path "$path"
+    done
+}
+
+watch_poll() {
+    echo -e "${Y}[WARN] inotifywait не знайдено -> fallback на polling кожні ${WATCH_INTERVAL}с (встанови пакет inotify-tools для миттєвої реакції)${Z}"
+    local known="$WORK_DIR/rt_known.tsv" cur="$WORK_DIR/rt_current.tsv"
+    find "$ROOT_DIR" -type f -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" 2>/dev/null \
+        | sort > "$known"
+    while true; do
+        sleep "$WATCH_INTERVAL"
+        find "$ROOT_DIR" -type f -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" 2>/dev/null \
+            | sort > "$cur"
+        comm -13 "$known" "$cur" | while IFS= read -r newpath; do
+            [ -n "$newpath" ] && feed_realtime_path "$newpath"
+        done
+        mv -f "$cur" "$known"
+    done
+}
+
+cleanup_realtime() {
+    exec 3>&- 2>/dev/null || true
+    [ -n "$REALTIME_WORKER_PID" ] && kill "$REALTIME_WORKER_PID" 2>/dev/null || true
+    [ -n "$REALTIME_TAIL_PID" ] && kill "$REALTIME_TAIL_PID" 2>/dev/null || true
+    [ -n "$REALTIME_FIFO" ] && rm -f "$REALTIME_FIFO" 2>/dev/null || true
+}
+
+run_realtime_watch() {
+    echo -e "\n${B}=================================================${Z}"
+    echo -e "${B} REAL-TIME MODE${Z} — базовий скан завершено, слідкую за ${C}${ROOT_DIR}${Z}"
+    echo -e " Ctrl+C щоб зупинити"
+    echo -e "${B}=================================================${Z}\n"
+
+    start_realtime_worker || return 1
+    tail_realtime_report
+
+    if command -v inotifywait &>/dev/null; then
+        watch_inotify
+    else
+        watch_poll
+    fi
+}
+
+# ============================================================================
+# 16. main() — єдина точка входу; жорстко фіксує порядок ініціалізації, тож
 #     жоден модуль ніколи не викликається раніше, ніж заповнені потрібні йому
 #     глобальні змінні.
 # ============================================================================
@@ -848,6 +1038,7 @@ main() {
     init_workdir
     check_deps
     detect_tools "$ALLOW_BUSYBOX"
+    init_quarantine
 
     extract_worker
     compile_signatures "$SIGNATURES" "$SIG_DIR"
@@ -869,6 +1060,13 @@ main() {
     print_report
     save_report
 
+    # Real-time watch стартує ПІСЛЯ базового скану (той самий trap cleanup
+    # вже активний і покриє й цю фазу — Ctrl+C/SIGTERM коректно зупинить
+    # і воркер-демон, і FIFO).
+    if [ "$REALTIME_MODE" = true ]; then
+        run_realtime_watch
+    fi
+
     rm -rf "$WORK_DIR"
     exit 0
 }
@@ -876,7 +1074,7 @@ main() {
 main "$@"
 
 # =============================================================================
-# 15. EMBEDDED WORKER (self-contained, теж модульний)
+# 17. EMBEDDED WORKER (self-contained, теж модульний)
 # =============================================================================
 #__WORKER_START__
 #!/bin/bash
@@ -898,6 +1096,8 @@ MD5_CMD="${8:-none}"
 STRINGS_CMD="${9:-bash}"
 FILE_CMD="${10:-bash}"
 YARA_CMD="${11:-none}"
+QUARANTINE_DIR="${12:-}"      # порожньо = карантин вимкнено
+QUARANTINE_PERM="${13:-0400}"
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
@@ -1036,10 +1236,55 @@ do_file_type() {
 # MODULE: logging
 # ----------------------------------------------------------------------------
 log() { printf '[%s] %s\n' "$WORKER_ID" "$*" >> "$REPORT"; }
-threat() { printf 'THREAT:%s\n' "$*" >> "$REPORT"; THREATS_FOUND=$(( THREATS_FOUND + 1 )); }
+
+# threat() — єдина точка входу для будь-якої знахідки: логує Й (за потреби)
+# одразу відправляє файл у карантин. Раніше виклики виглядали як
+# threat "TYPE|$file|info=..." (один рядок), що не давало явного доступу до
+# шляху файлу для подальших дій. Тепер сигнатура threat(type, file, info) —
+# формат рядка в звіті лишився ідентичним ("TYPE|file|info"), тож парсер
+# у головному скрипті (build_report/print_report) не зламався.
+threat() {
+    local type="$1" file="$2" info="${3:-}"
+    printf 'THREAT:%s|%s|%s\n' "$type" "$file" "$info" >> "$REPORT"
+    THREATS_FOUND=$(( THREATS_FOUND + 1 ))
+    [ -n "$QUARANTINE_DIR" ] && quarantine_file "$file" "$type"
+}
+
 progress() {
     printf 'FILES=%d\nTHREATS=%d\nCURRENT=%s\n' \
         "$FILES_SCANNED" "$THREATS_FOUND" "${1:-}" > "$PROGRESS"
+}
+
+# ----------------------------------------------------------------------------
+# MODULE: quarantine
+# ----------------------------------------------------------------------------
+quarantine_file() {
+    local src="$1" type="${2:-UNKNOWN}"
+    [ -n "$QUARANTINE_DIR" ] || return 0
+    [ -f "$src" ] || return 0
+
+    mkdir -p "$QUARANTINE_DIR" 2>/dev/null
+
+    # Ім'я в карантині = sha256(оригінальний_шлях) + оригінальна назва файлу.
+    # Це унікально ідентифікує файл (навіть якщо однакові імена лежали в
+    # різних директоріях) без потреби відтворювати всю оригінальну структуру
+    # директорій всередині карантину.
+    local path_hash qfile ts
+    ts=$(date +%s)
+    path_hash=$(printf '%s' "$src" | sha256sum 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1)
+    [ -z "$path_hash" ] && path_hash="$(date +%s%N)_$$"
+    qfile="${QUARANTINE_DIR}/${path_hash}_$(basename -- "$src")"
+
+    if mv -f -- "$src" "$qfile" 2>/dev/null; then
+        chmod "$QUARANTINE_PERM" "$qfile" 2>/dev/null
+        # Маніфест для відновлення: оригінальний_шлях <TAB> файл_в_карантині
+        # <TAB> тип_загрози <TAB> unix-час. Відновлення — це просто
+        # `mv "$qfile" "$src"` за даними з цього рядка.
+        printf '%s\t%s\t%s\t%s\n' "$src" "$qfile" "$type" "$ts" >> "${QUARANTINE_DIR}/manifest.tsv"
+        log "QUARANTINED: $src -> $qfile ($type)"
+    else
+        log "QUARANTINE_FAILED (mv error): $src ($type)"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -1070,7 +1315,7 @@ process_hash_batch() {
             tname=$(grep -F -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -d$'\t' -f2)
             local hit_file
             hit_file=$(printf '%s\n' "$out" | grep -iE "^${hit_hash}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
-            [ -n "$hit_file" ] && threat "KNOWN_MALWARE|$hit_file|name=${tname:-Malware}|$htype=$hit_hash"
+            [ -n "$hit_file" ] && threat "KNOWN_MALWARE" "$hit_file" "name=${tname:-Malware}|$htype=$hit_hash"
         done <<< "$hits"
     fi
 }
@@ -1087,7 +1332,7 @@ process_yara_batch() {
             [ -z "$yline" ] && continue
             local yrule; yrule=$(echo "$yline" | awk '{print $1}')
             local yfile; yfile=$(echo "$yline" | cut -d' ' -f2-)
-            threat "YARA_MATCH|$yfile|rule=$yrule"
+            threat "YARA_MATCH" "$yfile" "rule=$yrule"
         done <<< "$yara_out"
     fi
 }
@@ -1104,7 +1349,7 @@ check_file_heuristics() {
             local str_match
             str_match=$(do_strings "$file" 6 524288 | grep -F -i -f "$SIG_DIR/strings.txt" 2>/dev/null | head -1)
             if [ -n "$str_match" ]; then
-                threat "SIG_STRING_MATCH|$file|pattern=${str_match:0:50}"
+                threat "SIG_STRING_MATCH" "$file" "pattern=${str_match:0:50}"
                 return
             fi
         fi
@@ -1116,7 +1361,7 @@ check_file_heuristics() {
             if [ -n "$hex_dump" ]; then
                 hex_match=$(printf '%s\n' "$hex_dump" | grep -E -o -i -f "$SIG_DIR/hex_ere.txt" 2>/dev/null | head -1)
                 if [ -n "$hex_match" ]; then
-                    threat "HEX_SIG_MATCH|$file|hex=${hex_match:0:40}..."
+                    threat "HEX_SIG_MATCH" "$file" "hex=${hex_match:0:40}..."
                     return
                 fi
             fi
@@ -1131,16 +1376,16 @@ check_file_heuristics() {
                 if [ -n "$dh" ] && grep -qF "$dh" "$SIG_DIR/b64_payloads.tsv" 2>/dev/null; then
                     local bname
                     bname=$(grep -F -m 1 "^$dh" "$SIG_DIR/b64_payloads.tsv" | cut -d$'\t' -f2)
-                    threat "KNOWN_B64_PAYLOAD|$file|name=${bname:-B64.Malware}|b64=${chunk:0:20}..."
+                    threat "KNOWN_B64_PAYLOAD" "$file" "name=${bname:-B64.Malware}|b64=${chunk:0:20}..."
                     continue
                 fi
             fi
             local magic
             magic=$(printf '%s' "$chunk" | _b64decode 2>/dev/null | dd bs=8 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
             case "$magic" in
-                7f454c46*) threat "SUSPICIOUS_B64_PAYLOAD|$file|decoded=ELF|b64=${chunk:0:20}..." ;;
-                4d5a*)     threat "SUSPICIOUS_B64_PAYLOAD|$file|decoded=PE_MZ|b64=${chunk:0:20}..." ;;
-                2321*)     threat "SUSPICIOUS_B64_PAYLOAD|$file|decoded=SCRIPT|b64=${chunk:0:20}..." ;;
+                7f454c46*) threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=ELF|b64=${chunk:0:20}..." ;;
+                4d5a*)     threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=PE_MZ|b64=${chunk:0:20}..." ;;
+                2321*)     threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=SCRIPT|b64=${chunk:0:20}..." ;;
             esac
         done < <(grep -oE '[A-Za-z0-9+/]{40,}={0,2}' "$file" 2>/dev/null | head -20)
     fi
@@ -1153,7 +1398,7 @@ check_file_heuristics() {
             local real_type
             real_type=$(do_file_type "$file")
             case "$real_type" in
-                ELF|PE_MZ|SCRIPT) threat "DISGUISED_FILE|$file|ext=.$ext|real=$real_type" ;;
+                ELF|PE_MZ|SCRIPT) threat "DISGUISED_FILE" "$file" "ext=.$ext|real=$real_type" ;;
             esac
             ;;
     esac
@@ -1169,8 +1414,8 @@ check_file_heuristics() {
     if [ -n "$oct" ] && [ "$oct" != "0" ]; then
         oct="0000${oct}"
         oct="${oct: -4}"
-        (( 8#$oct & 8#6000 )) 2>/dev/null && threat "SUID_SGID|$file|perms=$oct"
-        (( 8#$oct & 8#0002 )) 2>/dev/null && (( 8#$oct & 8#0111 )) 2>/dev/null && threat "WORLD_WRITABLE_EXEC|$file|perms=$oct"
+        (( 8#$oct & 8#6000 )) 2>/dev/null && threat "SUID_SGID" "$file" "perms=$oct"
+        (( 8#$oct & 8#0002 )) 2>/dev/null && (( 8#$oct & 8#0111 )) 2>/dev/null && threat "WORLD_WRITABLE_EXEC" "$file" "perms=$oct"
     fi
 }
 
@@ -1231,7 +1476,7 @@ run_scan_loop() {
             case "${ext,,}" in
                 jpg|jpeg|png|gif)
                     if [ "$magic_type" = "ELF" ] || [ "$magic_type" = "PE_MZ" ]; then
-                        threat "DISGUISED_FILE|$file|ext=.$ext|real=$magic_type"
+                        threat "DISGUISED_FILE" "$file" "ext=.$ext|real=$magic_type"
                         skip_deep=false
                     fi
                     ;;
