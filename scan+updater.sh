@@ -289,7 +289,7 @@ detect_tools() {
 # 5. MODULE: CLI (usage, argument parsing, colors)
 # ============================================================================
 usage() {
-    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
+    head -n 40 "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
     exit 0
 }
 
