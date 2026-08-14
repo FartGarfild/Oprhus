@@ -84,8 +84,13 @@
 #   av_scan/
 #   ├── av_scan.sh              [REQUIRED]
 #   ├── bin/
-#   │   └── busybox             [RECOMMENDED] static busybox binary
-#   │                            (x86_64/arm64/armv7, linux-musl static build)
+#   │   ├── busybox              [RECOMMENDED] static busybox binary
+#   │   │                        (x86_64/arm64/armv7, linux-musl static build)
+#   │   ├── yara                 [RECOMMENDED] built by `av_scan.sh --setup`
+#   │   └── yarac                (not fetched automatically like busybox —
+#   │                            YARA ships no ready static binaries, so
+#   │                            --setup compiles them from source; needs
+#   │                            a C toolchain + network once)
 #   ├── signatures/              [OPTIONAL] signature DB; created by
 #   │   ├── maldet/               update_signatures() on -u if missing, or
 #   │   ├── clamav/                the scanner just runs on built-in
@@ -96,6 +101,7 @@
 #   │   │   ├── custom.sha256    [OPTIONAL] own hashes: "hash<TAB>name"
 #   │   │   ├── custom.md5       [OPTIONAL] same for MD5
 #   │   │   └── custom.strings   [OPTIONAL] own string signatures
+#   │   ├── .cache/               [AUTO] persistent compiled cache
 #   │   └── .compiled            [AUTO] compile flag, no need to ship
 #   └── quarantine/              [AUTO, only with -q] auto-created
 #       └── manifest.tsv           auto-created, no need to ship
@@ -103,8 +109,10 @@
 #   Temp work dirs (/dev/shm/av_scan_$$ or $TMPDIR/av_scan_$$) are created
 #   and removed by the script each run — not part of the package.
 #
-#   Minimal fully-offline archive: av_scan.sh + bin/busybox + signatures/.
-#   Minimal archive (needs network on first -u): av_scan.sh + bin/busybox.
+#   Minimal fully-offline archive: av_scan.sh + bin/{busybox,yara,yarac}
+#   + signatures/ (pre-populated). Just av_scan.sh alone also works: run
+#   `av_scan.sh --setup` once (needs network + a C toolchain) to build
+#   yara/yarac locally, and busybox auto-downloads on first scan.
 # =============================================================================
 set -uo pipefail
 export LC_ALL=C
@@ -382,7 +390,7 @@ detect_md5() {
 }
 
 detect_yara() {
-    # YARA isn't part of busybox, but a bundled bin/yara (see build_yara.sh)
+    # YARA isn't part of busybox, but a bundled bin/yara (see --setup)
     # is preferred over a system install for the same reason as busybox:
     # a known, consistent binary rather than whatever's on $PATH. YARA now
     # also does the .ndb/.ldb hex-signature matching (see MODULE: ClamAV
@@ -481,10 +489,10 @@ check_dependencies_report() {
 #
 # Builds yara/yarac from source and installs them at $SCRIPT_DIR/bin/,
 # alongside busybox. Unlike busybox, YARA does not publish ready static
-# binaries, so this compiles one (see build_yara.sh for the standalone
-# version of the same steps). Needs a C toolchain (installed automatically
-# via apt if missing and running as root/sudo) and network access to
-# fetch the YARA source tarball from GitHub.
+# binaries, so this compiles one itself — fully self-contained, no
+# external script needed (downloads source, installs a C toolchain via
+# apt/yum/apk if missing, configures, builds, strips, installs). Needs
+# root/sudo for the toolchain install and network access for the source.
 # ============================================================================
 run_self_setup() {
     local version="${SETUP_YARA_VERSION:-4.5.8}"
@@ -793,8 +801,8 @@ EOF
 # at a glance if an update download came back empty/truncated.
 report_signature_counts() {
     local sig_dir="$1"
-    local parsed_exts="hdb hdu hsb hsu ndb ndu ldb ldu"
-    local excluded_exts="mdb mdu msb msu cdb idb wdb pdb gdb ftm fp sfp"
+    local parsed_exts="hdb hdu hsb hsu ndb ndu ldb ldu mdb mdu"
+    local excluded_exts="msb msu cdb idb wdb pdb gdb ftm fp sfp"
 
     echo -e "${C}[*] Signature source counts (raw lines per file):${Z}"
 
@@ -1001,7 +1009,7 @@ compile_signatures() {
         echo -e "[*] Signatures already compiled -> reusing cache ($cache_dir)"
         mkdir -p "$out_dir"
         cp -f "$cache_dir"/sha256.tsv "$cache_dir"/md5.tsv "$cache_dir"/hex_ere.txt \
-              "$cache_dir"/strings.txt "$cache_dir"/b64_payloads.tsv "$out_dir/" 2>/dev/null || true
+              "$cache_dir"/strings.txt "$cache_dir"/b64_payloads.tsv "$cache_dir"/mdb.tsv "$out_dir/" 2>/dev/null || true
         [ -d "$cache_dir/yara" ] && cp -rf "$cache_dir/yara" "$out_dir/" 2>/dev/null
         return 0
     fi
@@ -1018,7 +1026,7 @@ python -c import socket
 chmod 777 /
 EOF
 
-    touch "$out_dir/sha256.tsv" "$out_dir/md5.tsv" "$out_dir/hex_ere.txt" "$out_dir/b64_payloads.tsv"
+    touch "$out_dir/sha256.tsv" "$out_dir/md5.tsv" "$out_dir/hex_ere.txt" "$out_dir/b64_payloads.tsv" "$out_dir/mdb.tsv"
 
     if [ ! -e "$sig_input" ]; then
         echo -e "${Y}[INFO] No signature base found. Using built-in heuristics only.${Z}"
@@ -1041,7 +1049,6 @@ EOF
             -not -path '*/.cache/*' \
             -not -name "*.pack" -not -name "*.idx" -not -name "*.cvd" \
             -not -name "*.yarc" -not -name "*.compiled" \
-            -not -name "*.mdb" -not -name "*.mdu" \
             -not -name "*.msb" -not -name "*.msu" \
             -not -name "*.cdb" -not -name "*.idb" -not -name "*.wdb" \
             -not -name "*.pdb" -not -name "*.gdb" -not -name "*.ftm" \
@@ -1071,12 +1078,23 @@ EOF
     #                           as a proper YARA rule (condition), so match
     #                           precision matches real ClamAV, not a
     #                           degraded "any fragment matches" heuristic
+    #   .mdb/.mdu             — PE SECTION MD5 hashes ("size:md5:name").
+    #                           The worker parses the PE section table
+    #                           itself (see _pe_section_table in the
+    #                           embedded worker), hashes each section's raw
+    #                           bytes, and batch-matches (size,md5) pairs
+    #                           against the compiled mdb.tsv — this is the
+    #                           single largest chunk of a real ClamAV
+    #                           database (often >50% of its total size),
+    #                           so this is worth a real PE parser rather
+    #                           than excluding it.
     #
     # Intentionally NOT supported (excluded above, not silently dropped):
-    #   .mdb/.mdu, .msb/.msu — PE SECTION hashes, not whole-file hashes.
-    #                          Without a PE parser these would never match
-    #                          anything, so they're excluded rather than
-    #                          wired in incorrectly.
+    #   .msb/.msu              — PE section SHA256 hashes (same idea as
+    #                          .mdb but SHA256) — real-world databases have
+    #                          this be a tiny fraction of a percent of
+    #                          total signatures (low priority; the MD5
+    #                          form above already covers the bulk).
     #   .cdb, .idb            — container signatures / icon hashes, need an
     #                          archive/PE-resource parser we don't have.
     #   .wdb, .pdb, .gdb       — domain/URL signatures, not file content.
@@ -1100,7 +1118,7 @@ EOF
     # emitting a broken condition.
     # ============================================================================
 
-    local hash_files=() ndb_files=() ldb_files=() generic_files=()
+    local hash_files=() ndb_files=() ldb_files=() sect_files=() generic_files=()
     local sf ext
     for sf in "${sig_files[@]}"; do
         ext="${sf##*.}"
@@ -1108,6 +1126,7 @@ EOF
             hdb|hdu|hsb|hsu) hash_files+=("$sf") ;;
             ndb|ndu)         ndb_files+=("$sf") ;;
             ldb|ldu)         ldb_files+=("$sf") ;;
+            mdb|mdu)         sect_files+=("$sf") ;;
             *)               generic_files+=("$sf") ;;
         esac
     done
@@ -1223,6 +1242,30 @@ EOF
         '
         cat "$tmp_hash_out" >> "$tmp_raw_sigs"
         rm -f "$tmp_hash" "$tmp_hash_out"
+    fi
+
+    # --- SECT category (.mdb/.mdu): "PESectionSize:PESectionMD5:Name" ---
+    # Unlike HASH, the hash is the MIDDLE field, and it identifies a PE
+    # SECTION's raw bytes, not the whole file — matched separately by the
+    # worker's PE section parser (see check_pe_sections / process_pe_batch).
+    if [ ${#sect_files[@]} -gt 0 ]; then
+        local tmp_sect="$out_dir/cat_sect.tmp" tmp_sect_out="$out_dir/cat_sect.out"
+        cat "${sect_files[@]}" > "$tmp_sect"
+        run_awk_parallel "$tmp_sect" "$tmp_sect_out" '
+            {
+                line = $0
+                sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+                if (line == "" || line ~ /^#/) next
+                n = split(line, a, ":")
+                if (n < 2) next
+                sz = a[1] + 0
+                h = tolower(a[2])
+                name = (n >= 3 ? a[3] : "ClamAV.Section")
+                if (sz > 0 && h ~ /^[0-9a-f]{32}$/) print "SECTMD5\t" sz "\t" h "\t" name
+            }
+        '
+        cat "$tmp_sect_out" >> "$tmp_raw_sigs"
+        rm -f "$tmp_sect" "$tmp_sect_out"
     fi
 
     # --- NDB category (.ndb/.ndu): "Name:Type:Offset:HexSig[:MinFL:MaxFL]" ---
@@ -1370,6 +1413,7 @@ EOF
             $1 == "B64"      { print $2 "\t" $3 >> (out "/b64_payloads.tsv") }
             $1 == "HEX"      { print $2 >> (out "/hex_ere.txt") }
             $1 == "YARARULE" { print $2 >> (out "/yara/generated_ndb_ldb.yar") }
+            $1 == "SECTMD5"  { print $2 "\t" $3 "\t" $4 >> (out "/mdb.tsv") }
         ' "$tmp_raw_sigs"
     fi
     rm -f "$tmp_raw_sigs"
@@ -1464,7 +1508,7 @@ EOF
 
     # Dedup (also collapses now-common ".*"-only variants of what used to be
     # distinct bounded-quantifier patterns)
-    for f in sha256.tsv md5.tsv strings.txt b64_payloads.tsv hex_ere.txt; do
+    for f in sha256.tsv md5.tsv strings.txt b64_payloads.tsv hex_ere.txt mdb.tsv; do
         [ -s "$out_dir/$f" ] && bb sort -u "$out_dir/$f" -o "$out_dir/$f" 2>/dev/null || true
     done
 
@@ -1486,12 +1530,13 @@ EOF
     # reuse them without recompiling (see comment at the top of this function)
     mkdir -p "$cache_dir"
     cp -f "$out_dir"/sha256.tsv "$out_dir"/md5.tsv "$out_dir"/hex_ere.txt \
-          "$out_dir"/strings.txt "$out_dir"/b64_payloads.tsv "$cache_dir/" 2>/dev/null || true
+          "$out_dir"/strings.txt "$out_dir"/b64_payloads.tsv "$out_dir"/mdb.tsv "$cache_dir/" 2>/dev/null || true
     [ -d "$out_dir/yara" ] && cp -rf "$out_dir/yara" "$cache_dir/" 2>/dev/null
     touch "$compiled_flag" 2>/dev/null || true
 
     echo -e "  SHA256 : ${C}$(bb wc -l < "$out_dir/sha256.tsv" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  MD5    : ${C}$(bb wc -l < "$out_dir/md5.tsv" 2>/dev/null | tr -d ' ')${Z}"
+    echo -e "  PE Sections (mdb): ${C}$(bb wc -l < "$out_dir/mdb.tsv" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  HexERE : ${C}$(bb wc -l < "$out_dir/hex_ere.txt" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  Strings: ${C}$(bb wc -l < "$out_dir/strings.txt" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  YARA   : ${C}$(bb find "$out_dir/yara" -name "*.ya*" 2>/dev/null | bb wc -l | tr -d ' ')${Z}"
@@ -1993,6 +2038,7 @@ HAS_B64=false
 HAS_STRINGS=false
 HAS_HEX_ERE=false
 HAS_YARA=false
+HAS_MDB=false
 YARA_TARGET=""
 BB_APPLETS=""
 
@@ -2000,14 +2046,21 @@ declare -a BATCH_SHA=()
 declare -a BATCH_MD5=()
 declare -a BATCH_YARA=()
 declare -a BATCH_HEUR=()
+declare -a BATCH_PE=()
 SHA_BATCH_CNT=0
 MD5_BATCH_CNT=0
 YARA_BATCH_CNT=0
 HEUR_BATCH_CNT=0
+PE_BATCH_CNT=0
 # Larger than the hash/YARA batch size on purpose: grep -E -f's automaton
 # build cost is paid once per batch regardless of size, so bigger batches
 # amortize it over more files.
 HEUR_BATCH_SIZE=200
+# Section-hash lookup against mdb.tsv (which can be millions of lines for a
+# real ClamAV database) has a large fixed per-call I/O cost that grows
+# somewhat with pattern count too — empirically ~50 files' worth of
+# sections (~200-400 candidates) per call keeps things reasonable.
+PE_BATCH_SIZE=50
 
 # ----------------------------------------------------------------------------
 # MODULE: busybox wrapper (own copy — the worker runs as a separate bash
@@ -2037,6 +2090,7 @@ init_worker_state() {
     [ -s "$SIG_DIR/b64_payloads.tsv" ] && HAS_B64=true
     [ -s "$SIG_DIR/strings.txt" ] && HAS_STRINGS=true
     [ -s "$SIG_DIR/hex_ere.txt" ] && HAS_HEX_ERE=true
+    [ -s "$SIG_DIR/mdb.tsv" ] && HAS_MDB=true
 
     if [ -f "$SIG_DIR/yara/rules.yarc" ]; then
         HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/rules.yarc"
@@ -2066,6 +2120,107 @@ _sha256_stdin() {
 _b64decode() {
     if [ "$OS" = "macos" ]; then base64 -D 2>/dev/null
     else base64 -d 2>/dev/null; fi
+}
+
+# ----------------------------------------------------------------------------
+# MODULE: PE section parsing (for .mdb ClamAV signatures — PE section hashes)
+#
+# Parses just enough of the PE/COFF header to find each section's raw
+# offset and raw size within the file: DOS header -> e_lfanew -> PE
+# signature -> COFF header (NumberOfSections, SizeOfOptionalHeader) ->
+# section table (40 bytes/entry, PointerToRawData @ +20, SizeOfRawData
+# @ +16). Only the first 4096 bytes are read, which covers the header of
+# virtually every real-world PE file.
+# ----------------------------------------------------------------------------
+_hex_byte() {
+    local h="${1:$(( $2 * 2 )):2}"
+    [ -z "$h" ] && { echo 0; return; }
+    echo $((16#$h))
+}
+_hex_le16() {
+    echo $(( $(_hex_byte "$1" "$2") + $(_hex_byte "$1" $(($2+1))) * 256 ))
+}
+_hex_le32() {
+    echo $(( $(_hex_byte "$1" "$2") \
+             + $(_hex_byte "$1" $(($2+1))) * 256 \
+             + $(_hex_byte "$1" $(($2+2))) * 65536 \
+             + $(_hex_byte "$1" $(($2+3))) * 16777216 ))
+}
+
+# Prints "offset\tsize" per PE section, one per line. Returns non-zero (no
+# output) if the file isn't a well-formed PE within the first 4096 bytes.
+_pe_section_table() {
+    local file="$1"
+    local hexdump
+    hexdump=$(bb dd if="$file" bs=4096 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n')
+    [ -z "$hexdump" ] && return 1
+    local hexlen=${#hexdump}
+
+    [ "${hexdump:0:4}" != "4d5a" ] && return 1
+
+    local e_lfanew
+    e_lfanew=$(_hex_le32 "$hexdump" 60)
+    [ "$e_lfanew" -le 0 ] 2>/dev/null && return 1
+    [ $(( (e_lfanew + 24) * 2 )) -gt "$hexlen" ] && return 1
+    [ "${hexdump:$((e_lfanew*2)):8}" != "50450000" ] && return 1
+
+    local num_sections opt_hdr_size sec_table_off
+    num_sections=$(_hex_le16 "$hexdump" $((e_lfanew+6)))
+    opt_hdr_size=$(_hex_le16 "$hexdump" $((e_lfanew+20)))
+    sec_table_off=$((e_lfanew + 24 + opt_hdr_size))
+
+    local i off ptr rawsize
+    for ((i = 0; i < num_sections && i < 96; i++)); do
+        off=$((sec_table_off + i * 40))
+        [ $(( (off + 40) * 2 )) -gt "$hexlen" ] && break
+        rawsize=$(_hex_le32 "$hexdump" $((off+16)))
+        ptr=$(_hex_le32 "$hexdump" $((off+20)))
+        [ "$rawsize" -gt 0 ] 2>/dev/null && printf '%s\t%s\n' "$ptr" "$rawsize"
+    done
+}
+
+# Batched (size, md5) lookup for a set of candidate PE files' sections
+# against mdb.tsv. Same rationale as the other batch functions: mdb.tsv can
+# be millions of lines for a real ClamAV database, so the per-call cost is
+# paid once for the whole batch, not once per file.
+process_pe_batch() {
+    [ $# -eq 0 ] || [ "$HAS_MDB" = false ] && return
+
+    local tmp_candidates
+    tmp_candidates=$(mktemp 2>/dev/null) || return
+    local -a cand_file=() cand_off=() cand_sz=() cand_md5=()
+    local idx=0 f sections off sz sec_md5
+
+    for f in "$@"; do
+        sections=$(_pe_section_table "$f" 2>/dev/null) || continue
+        [ -z "$sections" ] && continue
+        while IFS=$'\t' read -r off sz; do
+            [ -z "$sz" ] || [ "$sz" -le 0 ] 2>/dev/null && continue
+            [ "$sz" -gt 20971520 ] && continue   # 20MB/section sanity cap
+            sec_md5=$(tail -c "+$((off+1))" "$f" 2>/dev/null | head -c "$sz" | $MD5_CMD 2>/dev/null | bb grep -oE '[0-9a-f]{32}' | head -1)
+            [ -z "$sec_md5" ] && continue
+            printf '%s\t%s\n' "$sz" "$sec_md5" >> "$tmp_candidates"
+            cand_file[$idx]="$f"; cand_off[$idx]="$off"; cand_sz[$idx]="$sz"; cand_md5[$idx]="$sec_md5"
+            idx=$((idx + 1))
+        done <<< "$sections"
+    done
+
+    if [ -s "$tmp_candidates" ]; then
+        local hits
+        hits=$(bb grep -F -f "$tmp_candidates" "$SIG_DIR/mdb.tsv" 2>/dev/null)
+        if [ -n "$hits" ]; then
+            local hsz hhash hname i
+            while IFS=$'\t' read -r hsz hhash hname; do
+                [ -z "$hhash" ] && continue
+                for ((i = 0; i < idx; i++)); do
+                    if [ "${cand_sz[$i]}" = "$hsz" ] && [ "${cand_md5[$i]}" = "$hhash" ]; then
+                        threat "KNOWN_MALWARE_SECTION" "${cand_file[$i]}" "name=${hname:-Section.Malware}|size=$hsz|md5=$hhash"
+                    fi
+                done
+            done <<< "$hits"
+        fi
+    fi
+    rm -f "$tmp_candidates"
 }
 
 _bash_strings() {
@@ -2450,6 +2605,17 @@ run_scan_loop() {
                     BATCH_HEUR=(); HEUR_BATCH_CNT=0
                 fi
             fi
+
+            # Batched PE-section hash matching (.mdb signatures) — only for
+            # files whose magic bytes actually look like a PE/MZ executable.
+            if [ "$HAS_MDB" = true ] && [ "$magic_type" = "PE_MZ" ]; then
+                BATCH_PE+=("$file")
+                PE_BATCH_CNT=$(( PE_BATCH_CNT + 1 ))
+                if [ "$PE_BATCH_CNT" -ge "$PE_BATCH_SIZE" ]; then
+                    process_pe_batch "${BATCH_PE[@]}"
+                    BATCH_PE=(); PE_BATCH_CNT=0
+                fi
+            fi
         fi
 
         # Cheap per-file checks (base64 payloads, disguised ext, perms)
@@ -2463,6 +2629,7 @@ run_scan_loop() {
     [ "$MD5_BATCH_CNT" -gt 0 ] && process_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
     [ "$YARA_BATCH_CNT" -gt 0 ] && process_yara_batch "${BATCH_YARA[@]}"
     [ "$HEUR_BATCH_CNT" -gt 0 ] && process_heuristic_batch "${BATCH_HEUR[@]}"
+    [ "$PE_BATCH_CNT" -gt 0 ] && process_pe_batch "${BATCH_PE[@]}"
 }
 
 # ----------------------------------------------------------------------------
