@@ -1,24 +1,28 @@
 #!/bin/bash
 # =============================================================================
-# Oprhus AV Scanner Unified v6.3 (modular + quarantine + real-time)
+# Oprhus AV Scanner Unified v6.4 (modular + quarantine + real-time + busybox-first)
 # Features:
 #   - Built-in signature updater (Maldet, ClamAV, YARA, MalwareBazaar, custom)
 #   - Parallel workers with batch hashing (SHA256 + MD5) and YARA batching
 #   - Zero-RAM lookup + strict RAM ceiling
-#   - Real-time RAM / CPU / ETA / FPS monitor (progress UI, не плутати з
-#     режимом --real-time нижче)
+#   - Live RAM / CPU / ETA / FPS progress monitor
 #   - Full heuristics: strings, hex-ERE, b64 payloads, disguised files, SUID/SGID
-#   - Magic-bytes fast filter + busybox fallback
-#   - Quarantine mode: перенесення виявлених файлів в ізольовану директорію
-#   - Real-time watch mode: фоновий демон, що індексує дерево файлів і
-#     автоматично сканує щойно створені файли
+#   - Magic-bytes fast filter
+#   - Quarantine mode: moves detected files to an isolated directory
+#   - Real-time watch mode: background daemon, scans new files as they appear
 #   - Pure self-contained single file
+#
+# BusyBox-first: looks for a local busybox (./bin/busybox); if missing, tries
+# to auto-download a static binary (no prompts). Once available, all key ops
+# (hashing, strings, find/grep/awk in the signature pipeline) go through it
+# instead of $PATH. System tools are only a fallback. Exception: the first
+# download itself needs system wget/curl (nothing else to fetch busybox with).
 #
 # Usage:
 #   ./av_scan.sh [OPTIONS]
 #
 # Options:
-#   -u, --update            Update all signatures before scanning
+#   -u, --update            Update signatures and EXIT (no auto-scan after)
 #   -r, --max-ram MB        Max RAM limit in megabytes (default: 500)
 #   -j, --workers N         Number of parallel worker processes (default: auto)
 #   -d, --dir PATH          Target directory to scan (default: /mnt)
@@ -26,54 +30,93 @@
 #   -m, --max-size MB       Max file size for deep inspection in MB (default: 10)
 #   -o, --output FILE       Save final report to file
 #   --no-ram                Force /tmp instead of /dev/shm
-#   --no-busybox            Do not offer busybox download
+#   --no-busybox            Fully disable busybox (no auto-download, no local
+#                            binary use) — system tools only
+#   -b, --busybox PATH      Explicit path to an existing busybox binary
 #   --mb-key KEY            MalwareBazaar Auth-Key (optional)
 #   -q, --quarantine        Enable quarantine mode (default dir: ./quarantine)
 #   --quarantine-dir PATH   Enable quarantine mode with a custom directory
-#   --quarantine-perm MODE  chmod-режим для карантинних файлів (default: 0400,
-#                            тобто лише читання, без запуску)
-#   -w, --real-time         Після базового скану перейти в режим фонового
-#                            моніторингу: новостворені файли перевіряються
-#                            автоматично (inotifywait, або polling як фолбек)
-#   --watch-interval SEC    Інтервал опитування для polling-фолбеку (default: 5)
-#   -h, --help               Show this help
+#   --quarantine-perm MODE  chmod mode for quarantined files (default: 0400,
+#                            i.e. read-only, not executable)
+#   -w, --real-time         After the base scan, switch to background watch
+#                            mode: new files get scanned automatically
+#                            (inotifywait, or polling as fallback)
+#   --watch-interval SEC    Polling interval for the fallback watcher (default: 5)
+#   --max-hex-patterns N    Cap on compiled hex signature patterns (default:
+#                            8000) — grep -E -f cannot build a usable match
+#                            automaton from a full real ClamAV .ndb+.ldb set
+#                            (100k+ patterns); raising this trades scan
+#                            speed for hex-signature coverage
+#   --setup                  Build yara/yarac from source into bin/ (and
+#                            fetch busybox if missing), then exit. Needs a
+#                            C toolchain (auto-installed via apt/yum/apk if
+#                            possible) and network access.
+#   --setup --force           Same, but rebuild even if bin/yara already exists
+#   --check-deps             Print bundled/system/missing status for
+#                            busybox and yara/yarac, then exit
+#   -h, --help               Show this help (also runs --check-deps)
 #
-# ── Структура файлу ──────────────────────────────────────────────────────────
-#   1. GLOBALS         — усі змінні скрипта, визначені один раз тут
+# File layout:
+#   1. GLOBALS         — all script variables, defined once here
 #   2. MODULE: platform / cpu
-#   3. MODULE: hash & yara detection
-#   4. MODULE: busybox / strings / file fallback
+#   3. MODULE: busybox bootstrap (find / auto-download / bb wrapper)
+#   4. MODULE: hash & yara & strings/file detection (busybox-first)
 #   5. MODULE: CLI (usage, parse_args, colors)
 #   6. MODULE: worker sizing / RAM guard
-#   7. MODULE: quarantine (ініціалізація на боці головного скрипта)
+#   7. MODULE: quarantine (main-script side init)
 #   8. MODULE: signature updater
-#   9. MODULE: signature compiler
+#   9. MODULE: signature compiler (+ parallel awk pool)
 #  10. MODULE: workdir & worker extraction
 #  11. MODULE: dependency check
 #  12. MODULE: file collection & worker orchestration
 #  13. MODULE: progress monitor / cleanup
 #  14. MODULE: reporting
-#  15. MODULE: real-time watch (фоновий демон)
-#  16. main()          — єдина точка, що викликає модулі в потрібному порядку
-#  17. EMBEDDED WORKER  — окремий self-contained скрипт (теж модульний;
-#                          містить і сканування, і фактичний карантин)
+#  15. MODULE: real-time watch (background daemon)
+#  16. main()          — single entry point, calls modules in order
+#  17. EMBEDDED WORKER  — separate self-contained script (also modular;
+#                          does the scanning and the actual quarantine)
+#
+# Package layout (for building a distributable archive):
+#   Paths below are relative to SCRIPT_DIR (where av_scan.sh lives). Only
+#   av_scan.sh itself is required; everything else is either bundled or
+#   auto-created on first run.
+#
+#   av_scan/
+#   ├── av_scan.sh              [REQUIRED]
+#   ├── bin/
+#   │   └── busybox             [RECOMMENDED] static busybox binary
+#   │                            (x86_64/arm64/armv7, linux-musl static build)
+#   ├── signatures/              [OPTIONAL] signature DB; created by
+#   │   ├── maldet/               update_signatures() on -u if missing, or
+#   │   ├── clamav/                the scanner just runs on built-in
+#   │   ├── hashes/                heuristics without it.
+#   │   ├── yara/
+#   │   ├── strings/
+#   │   ├── custom/
+#   │   │   ├── custom.sha256    [OPTIONAL] own hashes: "hash<TAB>name"
+#   │   │   ├── custom.md5       [OPTIONAL] same for MD5
+#   │   │   └── custom.strings   [OPTIONAL] own string signatures
+#   │   └── .compiled            [AUTO] compile flag, no need to ship
+#   └── quarantine/              [AUTO, only with -q] auto-created
+#       └── manifest.tsv           auto-created, no need to ship
+#
+#   Temp work dirs (/dev/shm/av_scan_$$ or $TMPDIR/av_scan_$$) are created
+#   and removed by the script each run — not part of the package.
+#
+#   Minimal fully-offline archive: av_scan.sh + bin/busybox + signatures/.
+#   Minimal archive (needs network on first -u): av_scan.sh + bin/busybox.
 # =============================================================================
 set -uo pipefail
 export LC_ALL=C
 
 # ============================================================================
-# 1. GLOBALS — усі змінні скрипта визначені один раз тут, ДО будь-якого коду,
-#    що їх використовує. Дефолти або порожні "заглушки"; реальні значення
-#    заповнюються відповідними init_*/detect_* функціями та parse_args().
-#    Це усуває клас помилок "змінна використана раніше, ніж визначена"
-#    (напр. WORKERS=$(cpu_count) викликався в оригіналі до оголошення
-#    функції cpu_count — тут такого бути не може, бо порядок жорстко
-#    контролює main()).
+# 1. GLOBALS — all script variables defined once here, before any code uses
+#    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
-VERSION="6.2"
+VERSION="6.4"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# --- CLI-конфігуровані параметри (дефолти, можуть бути перевизначені parse_args) ---
+# --- CLI-configured params (defaults, overridable via parse_args) ---
 SIGNATURES="${SCRIPT_DIR}/signatures"
 ROOT_DIR="/mnt"
 MAX_SCAN_MB=10
@@ -83,17 +126,19 @@ DO_UPDATE=false
 USE_RAM=true
 ALLOW_BUSYBOX=true
 MB_KEY=""
-WORKERS=""            # порожньо = "авто", вираховується в init_workers()
+WORKERS=""            # empty = "auto", resolved in init_workers()
+MAX_HEX_PATTERNS=8000 # cap on compiled hex_ere.txt entries, see compile_signatures
+DO_SETUP=false         # --setup: build yara/yarac (and fetch busybox) then exit
+SETUP_FORCE=false       # --setup --force: rebuild even if already present
+DO_CHECK_DEPS=false     # --check-deps: print dependency status and exit
 
-# --- Карантин ---
+# --- Quarantine ---
 QUARANTINE_ENABLED=false
 QUARANTINE_DIR="${SCRIPT_DIR}/quarantine"
-QUARANTINE_PERM="0400"   # read-only, без виконання (НЕ буквальне "100" —
-                          # 100 у chmod означає --x------, тобто "лише
-                          # виконання", протилежне до "тільки читання без
-                          # запуску"; 0400 = r-------- це і є той режим)
+QUARANTINE_PERM="0400"   # read-only, not executable (NOT literal "100" —
+                          # that means --x------, the opposite)
 
-# --- Real-time watch (фоновий демон) ---
+# --- Real-time watch (background daemon) ---
 REALTIME_MODE=false
 WATCH_INTERVAL=5
 REALTIME_FIFO=""
@@ -101,38 +146,41 @@ REALTIME_WORKER_PID=""
 REALTIME_REPORT=""
 REALTIME_TAIL_PID=""
 
-# --- Платформа (заповнює detect_platform) ---
+# --- Platform (filled by detect_platform) ---
 OS=""
 ARCH=""
 
-# --- Інструменти (заповнюють detect_tools / detect_sha256 / detect_md5 / detect_yara) ---
-BUSYBOX_BIN=""
+# --- Toolchain (filled by init_toolchain / detect_sha256 / detect_md5 / detect_yara) ---
+BUSYBOX_BIN=""        # path to busybox binary (empty = not found/disabled)
+BUSYBOX_PATH_ARG=""   # explicit path from -b/--busybox, if given
+BB_APPLETS=""         # cached applet list, space-padded on both ends
 STRINGS_CMD="bash"
 FILE_CMD="bash"
 SHA256_CMD="none"
 MD5_CMD="none"
 YARA_CMD="none"
+YARAC_BIN=""           # path to yarac (compile-time only; empty = not found
 
-# --- Робочі шляхи рантайму (заповнює init_workdir) ---
+# --- Runtime work paths (filled by init_workdir) ---
 WORK_DIR=""
 WORKER_FILE=""
 SIG_DIR=""
 
-# --- Кольори термінала (заповнює setup_colors) ---
+# --- Terminal colors (filled by setup_colors) ---
 R=''; Y=''; G=''; C=''; B=''; Z=''
 
-# --- Стан сканування ---
+# --- Scan state ---
 START_MS=0
 END_MS=0
 ELAPSED_S=0
 TOTAL_FILES=0
 WORKER_PIDS=()
 MONITOR_PID=""
-TF=0            # files scanned (сумарно по воркерах)
-TT=0            # threats found (сумарно по воркерах)
-QC=0            # quarantined (сумарно по воркерах)
+TF=0            # files scanned (total across workers)
+TT=0            # threats found (total across workers)
+QC=0            # quarantined (total across workers)
 SPEED=0
-RPT=""          # текст фінального звіту
+RPT=""          # final report text
 
 # ============================================================================
 # 2. MODULE: platform / cpu
@@ -162,37 +210,51 @@ now_ms() {
 }
 
 # ============================================================================
-# 3. MODULE: hash & yara detection
+# 3. MODULE: busybox bootstrap (find / auto-download / bb wrapper)
 # ============================================================================
-detect_sha256() {
-    if command -v sha256sum &>/dev/null; then echo "sha256sum"
-    elif command -v shasum &>/dev/null; then echo "shasum -a 256"
-    elif command -v openssl &>/dev/null; then echo "openssl dgst -sha256"
-    else echo "none"; fi
-}
+net_fetch() {
+    # Downloader chain: busybox wget -> system wget -> system curl.
+    # Optional 4th arg is a User-Agent (e.g. for the ClamAV mirror).
+    local url="$1" dest="$2" timeout="${3:-10}" ua="${4:-}"
 
-detect_md5() {
-    if command -v md5sum &>/dev/null; then echo "md5sum"
-    elif command -v md5 &>/dev/null; then echo "md5 -q"
-    elif command -v openssl &>/dev/null; then echo "openssl dgst -md5"
-    else echo "none"; fi
-}
-
-detect_yara() {
-    command -v yara &>/dev/null && echo "yara" || echo "none"
-}
-
-# ============================================================================
-# 4. MODULE: busybox / strings / file fallback
-# ============================================================================
-check_network() {
-    if command -v curl &>/dev/null; then
-        curl -sf --connect-timeout 3 "https://busybox.net" >/dev/null 2>&1
-    elif command -v wget &>/dev/null; then
-        wget -q --timeout=3 --spider "https://busybox.net" 2>/dev/null
-    else
-        return 1
+    if [ -n "$BUSYBOX_BIN" ] && "$BUSYBOX_BIN" wget --help &>/dev/null 2>&1; then
+        if [ -n "$ua" ]; then
+            "$BUSYBOX_BIN" wget -q -T "$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        else
+            "$BUSYBOX_BIN" wget -q -T "$timeout" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        fi
     fi
+    if command -v wget &>/dev/null; then
+        if [ -n "$ua" ]; then
+            wget -q --timeout="$timeout" -U "$ua" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        else
+            wget -q --timeout="$timeout" -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        fi
+    fi
+    if command -v curl &>/dev/null; then
+        if [ -n "$ua" ]; then
+            curl -fsSL -A "$ua" --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        else
+            curl -fsSL --connect-timeout "$timeout" -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ] && return 0
+        fi
+    fi
+    rm -f "$dest" 2>/dev/null
+    return 1
+}
+
+check_network() {
+    # On the first call, BUSYBOX_BIN is still empty, so this naturally
+    # falls back to system wget/curl (same bootstrap exception as net_fetch).
+    if [ -n "$BUSYBOX_BIN" ] && "$BUSYBOX_BIN" wget --help &>/dev/null 2>&1; then
+        "$BUSYBOX_BIN" wget -q -T 3 -O /dev/null "https://busybox.net" 2>/dev/null && return 0
+    fi
+    if command -v wget &>/dev/null; then
+        wget -q --timeout=3 --spider "https://busybox.net" 2>/dev/null && return 0
+    fi
+    if command -v curl &>/dev/null; then
+        curl -sf --connect-timeout 3 "https://busybox.net" >/dev/null 2>&1 && return 0
+    fi
+    return 1
 }
 
 busybox_url() {
@@ -204,83 +266,173 @@ busybox_url() {
     esac
 }
 
-download_busybox() {
-    local url="$1" dest="$SCRIPT_DIR/bin/busybox"
-    mkdir -p "$SCRIPT_DIR/bin"
-    echo -e "${C}[*] Downloading busybox (~1MB)...${Z}"
-    local ok=false
-    if command -v curl &>/dev/null; then
-        curl -fL --progress-bar -o "$dest" "$url" 2>&1 && ok=true
-    elif command -v wget &>/dev/null; then
-        wget -q --show-progress -O "$dest" "$url" 2>&1 && ok=true
-    fi
-    if $ok && [ -s "$dest" ]; then
-        chmod +x "$dest"
-        if "$dest" strings --help &>/dev/null 2>&1; then
-            echo -e "${G}[OK] busybox saved: $dest${Z}"
-            BUSYBOX_BIN="$dest"
-            return 0
-        fi
-    fi
-    rm -f "$dest" 2>/dev/null
-    echo -e "${R}[FAIL] busybox download/verify failed${Z}"
-    return 1
-}
-
-offer_busybox() {
-    local util="$1" allow="$2"
-    [ "$allow" = "false" ] || [ "$OS" = "macos" ] && return 1
-    local url; url=$(busybox_url)
-    [ -z "$url" ] && return 1
-    if [ -n "$BUSYBOX_BIN" ] && [ -x "$BUSYBOX_BIN" ]; then
-        echo -e "${G}[OK] '${util}' -> pre-loaded busybox${Z}"
-        return 0
-    fi
-    echo -e "${Y}[WARN] '${util}' not found${Z}"
-    if ! check_network; then
-        echo -e "${Y}[WARN] No network -> bash fallback${Z}"
-        return 1
-    fi
-    echo -e "${C} Download static busybox for faster scanning? [Y/n]: ${Z}"
-    local ans
-    if read -r -t 12 ans 2>/dev/null; then ans="${ans,,}"; else echo ""; ans="n"; fi
-    case "$ans" in
-        ""|y|yes) download_busybox "$url"; return $? ;;
-        *) echo -e "${Y}[INFO] Skipped -> bash fallback${Z}"; return 1 ;;
-    esac
+verify_busybox_binary() {
+    # Sanity check: executable, and --help output looks like busybox.
+    local c="$1"
+    [ -x "$c" ] || return 1
+    "$c" --help 2>&1 | head -1 | grep -qi "busybox" || return 1
+    return 0
 }
 
 find_local_busybox() {
-    local c="$SCRIPT_DIR/bin/busybox"
-    if [ -x "$c" ] && "$c" strings --help &>/dev/null 2>&1; then
-        BUSYBOX_BIN="$c"; return 0
-    fi
+    # Priority: explicit -b/--busybox -> $SCRIPT_DIR/bin/busybox.
+    local candidates=()
+    [ -n "$BUSYBOX_PATH_ARG" ] && candidates+=("$BUSYBOX_PATH_ARG")
+    candidates+=("$SCRIPT_DIR/bin/busybox")
+
+    local c
+    for c in "${candidates[@]}"; do
+        if verify_busybox_binary "$c"; then
+            BUSYBOX_BIN="$c"
+            return 0
+        fi
+    done
     return 1
 }
 
-detect_tools() {
-    local allow_busybox="$1"
-    echo -e "[*] Detecting utilities..."
-    find_local_busybox && echo -e "${G}[OK] local busybox: $BUSYBOX_BIN${Z}"
-
-    if command -v strings &>/dev/null; then
-        STRINGS_CMD="strings"; echo -e "${G}[OK] strings : native${Z}"
-    elif [ -n "$BUSYBOX_BIN" ]; then
-        STRINGS_CMD="$BUSYBOX_BIN strings"; echo -e "${G}[OK] strings : busybox${Z}"
-    elif offer_busybox "strings" "$allow_busybox" && [ -n "$BUSYBOX_BIN" ]; then
-        STRINGS_CMD="$BUSYBOX_BIN strings"
+download_busybox() {
+    local url="$1" dest="$SCRIPT_DIR/bin/busybox"
+    mkdir -p "$SCRIPT_DIR/bin"
+    echo -e "${C}[*] BusyBox not found locally -> auto-downloading (~1MB)...${Z}"
+    if net_fetch "$url" "$dest" 15 && verify_busybox_binary "$dest" 2>/dev/null; then
+        :
     else
-        STRINGS_CMD="bash"; echo -e "${Y}[WARN] strings : bash fallback${Z}"
+        chmod +x "$dest" 2>/dev/null
+        verify_busybox_binary "$dest" || { rm -f "$dest" 2>/dev/null; echo -e "${R}[FAIL] BusyBox download/verify failed${Z}"; return 1; }
+    fi
+    chmod +x "$dest" 2>/dev/null
+    echo -e "${G}[OK] busybox saved: $dest${Z}"
+    BUSYBOX_BIN="$dest"
+    return 0
+}
+
+ensure_busybox() {
+    # busybox ships together with the scanner, so find_local_busybox should
+    # succeed on the first try. Anything past that (auto-download, system
+    # fallback) means the package is damaged/incomplete, hence WARN/FAIL.
+    [ "$ALLOW_BUSYBOX" = true ] || { echo -e "${Y}[INFO] BusyBox disabled (--no-busybox) -> system tools only${Z}"; return 1; }
+
+    find_local_busybox && { echo -e "${G}[OK] Local busybox: $BUSYBOX_BIN${Z}"; return 0; }
+
+    echo -e "${R}[WARN] Expected bundled busybox not found at ${SCRIPT_DIR}/bin/busybox${Z}"
+    echo -e "${R}       This is unusual — check the package (file missing or corrupted).${Z}"
+
+    if [ "$OS" = "macos" ]; then
+        echo -e "${Y}[INFO] macOS: no official static busybox builds -> system tools${Z}"
+        return 1
     fi
 
-    if command -v file &>/dev/null; then
-        FILE_CMD="file"; echo -e "${G}[OK] file : native${Z}"
-    elif [ -n "$BUSYBOX_BIN" ]; then
-        FILE_CMD="$BUSYBOX_BIN file"; echo -e "${G}[OK] file : busybox${Z}"
-    elif offer_busybox "file" "$allow_busybox" && [ -n "$BUSYBOX_BIN" ]; then
-        FILE_CMD="$BUSYBOX_BIN file"
+    if check_network; then
+        echo -e "${Y}[*] Trying emergency auto-download as a fallback...${Z}"
+        download_busybox "$(busybox_url)" && return 0
+        echo -e "${R}[WARN] Emergency download also failed -> system tools (shell fallback)${Z}"
+        return 1
     else
-        FILE_CMD="bash"; echo -e "${Y}[WARN] file : bash magic-bytes${Z}"
+        echo -e "${R}[WARN] No network -> system tools (shell fallback), no busybox${Z}"
+        return 1
+    fi
+}
+
+busybox_has_applet() {
+    case "$BB_APPLETS" in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+cache_busybox_applets() {
+    [ -n "$BUSYBOX_BIN" ] || return 0
+    local a
+    BB_APPLETS=" "
+    while IFS= read -r a; do
+        [ -n "$a" ] && BB_APPLETS="${BB_APPLETS}${a} "
+    done < <("$BUSYBOX_BIN" --list 2>/dev/null)
+}
+
+# bb <applet> [args...] — runs the applet via busybox if available/supported,
+# else falls back to the system command of the same name.
+bb() {
+    local applet="$1"; shift
+    if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet "$applet"; then
+        "$BUSYBOX_BIN" "$applet" "$@"
+    else
+        command "$applet" "$@"
+    fi
+}
+
+# ============================================================================
+# 4. MODULE: hash & yara & strings/file detection (busybox-first)
+#    Priority: busybox applet -> system tool -> (for strings/file) our own
+#    self-contained dd+od based detector.
+# ============================================================================
+detect_sha256() {
+    if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet sha256sum; then echo "$BUSYBOX_BIN sha256sum"
+    elif command -v sha256sum &>/dev/null; then echo "sha256sum"
+    elif command -v shasum &>/dev/null; then echo "shasum -a 256"
+    elif command -v openssl &>/dev/null; then echo "openssl dgst -sha256"
+    else echo "none"; fi
+}
+
+detect_md5() {
+    if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet md5sum; then echo "$BUSYBOX_BIN md5sum"
+    elif command -v md5sum &>/dev/null; then echo "md5sum"
+    elif command -v md5 &>/dev/null; then echo "md5 -q"
+    elif command -v openssl &>/dev/null; then echo "openssl dgst -md5"
+    else echo "none"; fi
+}
+
+detect_yara() {
+    # YARA isn't part of busybox, but a bundled bin/yara (see build_yara.sh)
+    # is preferred over a system install for the same reason as busybox:
+    # a known, consistent binary rather than whatever's on $PATH. YARA now
+    # also does the .ndb/.ldb hex-signature matching (see MODULE: ClamAV
+    # format support) since grep -E -f cannot scale to that many patterns.
+    if [ -x "$SCRIPT_DIR/bin/yara" ]; then
+        echo "$SCRIPT_DIR/bin/yara"
+    elif command -v yara &>/dev/null; then
+        echo "yara"
+    else
+        echo "none"
+    fi
+}
+
+detect_yarac() {
+    if [ -x "$SCRIPT_DIR/bin/yarac" ]; then
+        YARAC_BIN="$SCRIPT_DIR/bin/yarac"
+    elif command -v yarac &>/dev/null; then
+        YARAC_BIN="yarac"
+    else
+        YARAC_BIN=""
+    fi
+}
+
+init_toolchain() {
+    echo -e "[*] Initializing toolchain..."
+    ensure_busybox
+    cache_busybox_applets
+
+    SHA256_CMD=$(detect_sha256)
+    MD5_CMD=$(detect_md5)
+
+    if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet strings; then
+        STRINGS_CMD="$BUSYBOX_BIN strings"; echo -e "${G}[OK] strings : busybox${Z}"
+    elif command -v strings &>/dev/null; then
+        STRINGS_CMD="strings"; echo -e "${Y}[OK] strings : system (fallback)${Z}"
+    else
+        STRINGS_CMD="bash"; echo -e "${Y}[WARN] strings : built-in bash detector${Z}"
+    fi
+
+    # "file" is not part of busybox; our own magic-bytes detector
+    # (_bash_file_type, dd/od based) already covers what we need.
+    FILE_CMD="bash"
+    echo -e "${G}[OK] file    : built-in magic-bytes detector${Z}"
+
+    echo -e " SHA256 : ${C}${SHA256_CMD}${Z}"
+    echo -e " MD5    : ${C}${MD5_CMD}${Z}"
+    if [ -n "$BUSYBOX_BIN" ]; then
+        echo -e " BusyBox: ${G}${BUSYBOX_BIN}${Z}"
+    else
+        echo -e " BusyBox: ${Y}not in use (system-only mode)${Z}"
     fi
     echo ""
 }
@@ -289,9 +441,133 @@ detect_tools() {
 # 5. MODULE: CLI (usage, argument parsing, colors)
 # ============================================================================
 usage() {
-    head -n 40 "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
+    awk '/^# ====/{c++; next} c==1' "$0" | sed 's/^# \{0,2\}//'
+    echo ""
+    check_dependencies_report
     exit 0
 }
+
+# Prints a plain status report of optional-but-important components
+# (busybox, yara/yarac) so the user immediately knows what will and won't
+# work, without having to start a scan first. Run automatically by -h/--help
+# and by --check-deps.
+check_dependencies_report() {
+    echo "Dependency check:"
+    if [ -x "$SCRIPT_DIR/bin/busybox" ]; then
+        echo "  [OK]   busybox : bundled at bin/busybox"
+    elif command -v busybox &>/dev/null; then
+        echo "  [WARN] busybox : not bundled, found on system PATH instead"
+    else
+        echo "  [MISS] busybox : not found — will try to auto-download on first run"
+        echo "         (needs network); or run: $0 --setup"
+    fi
+
+    if [ -x "$SCRIPT_DIR/bin/yara" ] && [ -x "$SCRIPT_DIR/bin/yarac" ]; then
+        echo "  [OK]   yara/yarac : bundled at bin/yara, bin/yarac"
+    elif command -v yara &>/dev/null && command -v yarac &>/dev/null; then
+        echo "  [WARN] yara/yarac : not bundled, found on system PATH instead"
+    else
+        echo "  [MISS] yara/yarac : not found — .ndb/.ldb ClamAV signatures and"
+        echo "         YARA_MATCH detection will be unavailable, and the"
+        echo "         hex/string fallback path is much slower at scale."
+        echo "         Fix: run '$0 --setup' to build them automatically"
+        echo "         (needs a C toolchain, or the ability to install one)."
+    fi
+    echo ""
+}
+
+# ============================================================================
+# MODULE: self-setup (--setup)
+#
+# Builds yara/yarac from source and installs them at $SCRIPT_DIR/bin/,
+# alongside busybox. Unlike busybox, YARA does not publish ready static
+# binaries, so this compiles one (see build_yara.sh for the standalone
+# version of the same steps). Needs a C toolchain (installed automatically
+# via apt if missing and running as root/sudo) and network access to
+# fetch the YARA source tarball from GitHub.
+# ============================================================================
+run_self_setup() {
+    local version="${SETUP_YARA_VERSION:-4.5.8}"
+    echo -e "${B}=== av_scan.sh self-setup ===${Z}"
+    echo "Target: $SCRIPT_DIR/bin/{yara,yarac}"
+    echo ""
+
+    if [ -x "$SCRIPT_DIR/bin/yara" ] && [ -x "$SCRIPT_DIR/bin/yarac" ] && [ "${SETUP_FORCE:-false}" != true ]; then
+        echo -e "${G}[OK] bin/yara and bin/yarac already present -> nothing to do (use --setup --force to rebuild)${Z}"
+        return 0
+    fi
+
+    if [ "$(id -u 2>/dev/null)" != "0" ] && ! command -v sudo &>/dev/null; then
+        echo -e "${R}[FAIL] Need root or sudo to install build dependencies (build-essential, autoconf, automake, libtool, pkg-config, libssl-dev)${Z}"
+        return 1
+    fi
+    local as_root=""
+    [ "$(id -u 2>/dev/null)" != "0" ] && as_root="sudo"
+
+    if command -v apt-get &>/dev/null; then
+        echo "[*] Installing build dependencies via apt..."
+        $as_root apt-get update -qq
+        $as_root apt-get install -y -qq build-essential autoconf automake libtool pkg-config libssl-dev curl
+    elif command -v yum &>/dev/null; then
+        echo "[*] Installing build dependencies via yum..."
+        $as_root yum install -y gcc make autoconf automake libtool pkgconfig openssl-devel curl
+    elif command -v apk &>/dev/null; then
+        echo "[*] Installing build dependencies via apk..."
+        $as_root apk add build-base autoconf automake libtool pkgconfig openssl-dev curl
+    else
+        echo -e "${R}[FAIL] No supported package manager found (apt/yum/apk) — install a C toolchain, autoconf, automake, libtool, pkg-config, and libssl-dev manually, then re-run --setup${Z}"
+        return 1
+    fi
+
+    local workdir
+    workdir=$(mktemp -d 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; return 1; }
+    echo "[*] Downloading YARA v${version} source..."
+    if ! net_fetch "https://github.com/VirusTotal/yara/archive/refs/tags/v${version}.tar.gz" "$workdir/yara.tar.gz" 30; then
+        echo -e "${R}[FAIL] Could not download YARA source (network?)${Z}"
+        rm -rf "$workdir"
+        return 1
+    fi
+    tar -xzf "$workdir/yara.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
+
+    (
+        cd "$workdir/yara-${version}" || exit 1
+        echo "[*] Configuring (static libyara, dynamic libcrypto/libc/libm only)..."
+        ./bootstrap.sh >/dev/null 2>&1
+        ./configure --disable-shared --enable-static >/tmp/av_yara_setup_configure.log 2>&1 || exit 1
+        echo "[*] Building (this can take a minute)..."
+        make -j"$(nproc 2>/dev/null || echo 2)" >/tmp/av_yara_setup_make.log 2>&1 || exit 1
+        strip ./yara ./yarac 2>/dev/null || true
+    )
+    local build_rc=$?
+
+    if [ $build_rc -ne 0 ] || [ ! -x "$workdir/yara-${version}/yara" ]; then
+        echo -e "${R}[FAIL] Build failed — see /tmp/av_yara_setup_configure.log and /tmp/av_yara_setup_make.log${Z}"
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    mkdir -p "$SCRIPT_DIR/bin"
+    cp "$workdir/yara-${version}/yara" "$workdir/yara-${version}/yarac" "$SCRIPT_DIR/bin/"
+    chmod +x "$SCRIPT_DIR/bin/yara" "$SCRIPT_DIR/bin/yarac"
+    rm -rf "$workdir"
+
+    echo -e "${G}[OK] Built: $SCRIPT_DIR/bin/yara, $SCRIPT_DIR/bin/yarac${Z}"
+    "$SCRIPT_DIR/bin/yara" --version
+    echo "     Dependencies: $(ldd "$SCRIPT_DIR/bin/yara" 2>/dev/null | awk '{print $1}' | grep -v '^$' | tr '\n' ' ')"
+
+    # busybox too, while we're setting things up, if it isn't there yet.
+    if [ ! -x "$SCRIPT_DIR/bin/busybox" ]; then
+        echo ""
+        echo "[*] busybox not bundled yet — attempting the same auto-download used at scan time..."
+        BUSYBOX_BIN=""
+        ensure_busybox
+    fi
+
+    echo ""
+    echo -e "${G}[OK] Setup complete.${Z} Re-run $0 --help to confirm dependency status."
+    return 0
+}
+
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -305,12 +581,17 @@ parse_args() {
             -o|--output)     OUTPUT_FILE="$2"; shift 2 ;;
             --no-ram)        USE_RAM=false; shift ;;
             --no-busybox)    ALLOW_BUSYBOX=false; shift ;;
+            -b|--busybox)    BUSYBOX_PATH_ARG="$2"; shift 2 ;;
             --mb-key)        MB_KEY="$2"; shift 2 ;;
             -q|--quarantine) QUARANTINE_ENABLED=true; shift ;;
             --quarantine-dir)  QUARANTINE_ENABLED=true; QUARANTINE_DIR="$2"; shift 2 ;;
             --quarantine-perm) QUARANTINE_PERM="$2"; shift 2 ;;
             -w|--real-time|--realtime) REALTIME_MODE=true; shift ;;
             --watch-interval)  WATCH_INTERVAL="$2"; shift 2 ;;
+            --max-hex-patterns) MAX_HEX_PATTERNS="$2"; shift 2 ;;
+            --setup)         DO_SETUP=true; shift ;;
+            --force)         SETUP_FORCE=true; shift ;;
+            --check-deps)    DO_CHECK_DEPS=true; shift ;;
             -h|--help)       usage ;;
             *) echo "Unknown parameter: $1"; exit 1 ;;
         esac
@@ -326,15 +607,12 @@ setup_colors() {
 
 # ============================================================================
 # 6. MODULE: worker sizing / RAM guard
-#    Замінює всі гілки логіки (кількість воркерів + RAM ceiling), які раніше
-#    були "розсипані" прямо в тілі скрипта.
 # ============================================================================
 init_workers() {
-    # WORKERS могло бути задано через -j/--workers; якщо ні — авто за CPU.
+    # WORKERS may be set via -j/--workers; otherwise auto by CPU count.
     [ -z "$WORKERS" ] && WORKERS=$(cpu_count)
 
-    # Захист: WORKERS має бути додатним цілим (напр. -j 0 або сміттєве
-    # значення не повинні призводити до ділення на нуль пізніше в awk).
+    # Guard: WORKERS must be a positive int (avoid div-by-zero later in awk).
     case "$WORKERS" in
         ''|*[!0-9]*) WORKERS=$(cpu_count) ;;
     esac
@@ -364,10 +642,10 @@ init_workers() {
 }
 
 # ============================================================================
-# 7. MODULE: quarantine (ініціалізація на боці головного скрипта)
-#    Фактичне перенесення файлу відбувається у воркері (EMBEDDED WORKER,
-#    функція quarantine_file) — саме там, де файл детектується, щоб не було
-#    затримки/гонитви між моментом виявлення і моментом ізоляції.
+# 7. MODULE: quarantine (main-script side init)
+#    The actual file move happens in the worker (quarantine_file) right
+#    where the threat is detected, to avoid a gap between detection and
+#    isolation.
 # ============================================================================
 init_quarantine() {
     [ "$QUARANTINE_ENABLED" = true ] || return 0
@@ -375,12 +653,11 @@ init_quarantine() {
     mkdir -p "$QUARANTINE_DIR" 2>/dev/null
     chmod 700 "$QUARANTINE_DIR" 2>/dev/null
 
-    # Попередження: якщо карантин лежить всередині цілі сканування, карантинні
-    # файли можуть потрапити в наступний прохід сканера (або в real-time watch)
-    # і будуть повторно позначені/оброблені.
+    # If quarantine is inside the scan target, quarantined files could get
+    # rescanned on the next pass (or by real-time watch).
     case "$QUARANTINE_DIR" in
         "$ROOT_DIR"/*|"$ROOT_DIR")
-            echo -e "${Y}[WARN] Карантинна директорія всередині цілі сканування ($ROOT_DIR) — можливе повторне сканування карантинних файлів${Z}"
+            echo -e "${Y}[WARN] Quarantine dir is inside the scan target ($ROOT_DIR) — quarantined files may get rescanned${Z}"
             ;;
     esac
 
@@ -388,7 +665,7 @@ init_quarantine() {
 }
 
 count_quarantined() {
-    grep -h "QUARANTINED:" "$WORK_DIR/reports"/*.txt 2>/dev/null | wc -l | tr -d ' '
+    bb grep -h "QUARANTINED:" "$WORK_DIR/reports"/*.txt 2>/dev/null | bb wc -l | tr -d ' '
 }
 
 # ============================================================================
@@ -403,10 +680,10 @@ update_signatures() {
 
     # 1. Maldet
     echo "[*] Maldet sigpack..."
-    wget -q https://cdn.rfxn.com/downloads/maldet-sigpack.tgz -O /tmp/maldet-sigpack.tgz 2>/dev/null || true
+    net_fetch "https://cdn.rfxn.com/downloads/maldet-sigpack.tgz" "/tmp/maldet-sigpack.tgz" 15
     if [ -s /tmp/maldet-sigpack.tgz ]; then
         tar -xzf /tmp/maldet-sigpack.tgz -C "$sig_dir/maldet" --strip-components=1 2>/dev/null || true
-        echo "  ✓ Maldet: $(find "$sig_dir/maldet" -type f 2>/dev/null | wc -l | tr -d ' ') files"
+        echo "  ✓ Maldet: $(bb find "$sig_dir/maldet" -type f 2>/dev/null | bb wc -l | tr -d ' ') files"
         rm -f /tmp/maldet-sigpack.tgz
     else
         echo "  ! Maldet download failed (skipped)"
@@ -415,10 +692,10 @@ update_signatures() {
     # 2. ClamAV
     echo "[*] ClamAV databases..."
     local clam_dir="$sig_dir/clamav"
-    curl -A "Mozilla/5.0" -sL --connect-timeout 10 "https://packages.microsoft.com/clamav/main.cvd" -o /tmp/main.cvd || true
-    curl -A "Mozilla/5.0" -sL --connect-timeout 10 "https://packages.microsoft.com/clamav/daily.cvd" -o /tmp/daily.cvd || true    
+    net_fetch "https://packages.microsoft.com/clamav/main.cvd" "/tmp/main.cvd" 10 "Mozilla/5.0"
+    net_fetch "https://packages.microsoft.com/clamav/daily.cvd" "/tmp/daily.cvd" 10 "Mozilla/5.0"
     if [ -s /tmp/main.cvd ] && [ -s /tmp/daily.cvd ]; then
-    # Перевірка, що це справді CVD, а не HTML від Cloudflare
+    # Check it's actually a CVD, not an HTML block page from Cloudflare
     if head -c 11 /tmp/main.cvd | grep -q "ClamAV-VDB"; then
         dd if=/tmp/main.cvd  bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
         dd if=/tmp/daily.cvd bs=512 skip=1 status=none 2>/dev/null | tar -xz -C "$clam_dir" 2>/dev/null || true
@@ -431,7 +708,8 @@ update_signatures() {
     echo " ! ClamAV download failed (skipped)"
 	fi
 
-    # 3. MalwareBazaar (optional)
+    # 3. MalwareBazaar (optional; curl+jq are outside busybox, silently
+    # skipped if either is missing)
     if [ -n "$mb_key" ] && [ "$mb_key" != "YOUR_AUTH_KEY_HERE" ]; then
         echo "[*] MalwareBazaar hashes..."
         if command -v curl &>/dev/null && command -v jq &>/dev/null; then
@@ -444,18 +722,22 @@ update_signatures() {
             cnt=$(wc -l < "$sig_dir/hashes/malwarebazaar.sha256" 2>/dev/null | tr -d ' ')
             echo "  ✓ MalwareBazaar: ${cnt:-0} hashes"
         else
-            echo "  ! curl/jq missing -> skipped"
+            echo "  ! curl/jq not found (outside busybox) -> skipped"
         fi
     fi
 
-    # 4. YARA rules
+    # 4. YARA rules (git is outside busybox; optional, skipped if missing)
     echo "[*] YARA rules..."
     local yara_dir="$sig_dir/yara"
-    for repo in "https://github.com/Neo23x0/signature-base.git" "https://github.com/Yara-Rules/rules.git"; do
-        local name; name=$(basename "$repo" .git)
-        git -C "$yara_dir/$name" pull --quiet 2>/dev/null || \
-            git clone --depth 1 "$repo" "$yara_dir/$name" --quiet 2>/dev/null || true
-    done
+    if command -v git &>/dev/null; then
+        for repo in "https://github.com/Neo23x0/signature-base.git" "https://github.com/Yara-Rules/rules.git"; do
+            local name; name=$(basename "$repo" .git)
+            git -C "$yara_dir/$name" pull --quiet 2>/dev/null || \
+                git clone --depth 1 "$repo" "$yara_dir/$name" --quiet 2>/dev/null || true
+        done
+    else
+        echo "  ! git not found (outside busybox) -> YARA rule update skipped"
+    fi
 
     if command -v yarac &>/dev/null; then
         echo "  [*] Compiling YARA rules (may take time)..."
@@ -502,12 +784,57 @@ EOF
     echo -e "\033[1;32m[OK] Signature update finished\033[0m"
     echo "    Size: $(du -sh "$sig_dir" 2>/dev/null | cut -f1)"
     echo ""
+
+    report_signature_counts "$sig_dir"
+}
+
+# Prints raw entry counts per signature file, split into "parsed by this
+# scanner" vs "excluded" (see MODULE: ClamAV format support). Lets you spot
+# at a glance if an update download came back empty/truncated.
+report_signature_counts() {
+    local sig_dir="$1"
+    local parsed_exts="hdb hdu hsb hsu ndb ndu ldb ldu"
+    local excluded_exts="mdb mdu msb msu cdb idb wdb pdb gdb ftm fp sfp"
+
+    echo -e "${C}[*] Signature source counts (raw lines per file):${Z}"
+
+    local ext f lines total_parsed=0
+    for ext in $parsed_exts; do
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            lines=$(bb wc -l < "$f" 2>/dev/null || echo 0)
+            [ "$lines" -eq 0 ] 2>/dev/null && continue
+            printf "  %-24s %10d lines\n" "$(basename "$f")" "$lines"
+            total_parsed=$((total_parsed + lines))
+        done < <(bb find "$sig_dir" -type f -name "*.${ext}" 2>/dev/null)
+    done
+    echo -e "  ${G}Total parsed (supported formats): ${total_parsed} lines${Z}"
+
+    local excl_bytes=0
+    for ext in $excluded_exts; do
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            excl_bytes=$((excl_bytes + $(bb stat -c%s "$f" 2>/dev/null || echo 0)))
+        done < <(bb find "$sig_dir" -type f -name "*.${ext}" 2>/dev/null)
+    done
+    if [ "$excl_bytes" -gt 0 ]; then
+        local excl_human
+        if [ "$excl_bytes" -ge 1048576 ]; then
+            excl_human="$(( excl_bytes / 1048576 )) MB"
+        elif [ "$excl_bytes" -ge 1024 ]; then
+            excl_human="$(( excl_bytes / 1024 )) KB"
+        else
+            excl_human="${excl_bytes} bytes"
+        fi
+        echo -e "  ${Y}Excluded (unsupported formats — .mdb/.msb/.cdb/.idb/.wdb/.pdb/.ftm/.fp/.sfp): ${excl_human} not parsed${Z}"
+    fi
+    echo ""
 }
 
 # ============================================================================
-# PARALLEL AWK WRAPPER (v5.3.1 — production ready)
+# PARALLEL AWK WRAPPER
 # ============================================================================
-# Приймає: $1 = вхідний файл, $2 = вихідний файл, $3 = awk script / logic
+# $1 = input file, $2 = output file, $3 = awk script
 run_awk_parallel() {
     local infile="$1"
     local outfile="$2"
@@ -534,7 +861,9 @@ run_awk_parallel() {
 
     local chunk_dir
     chunk_dir=$(mktemp -d 2>/dev/null || mktemp -d -t 'awk_chunks.XXXXXX')
-    trap 'rm -rf "$chunk_dir"' EXIT
+    # chunk_dir is removed explicitly at the end of this function (not via
+    # a trap — a trap set here would fire on the whole script's exit, not
+    # just this function's return).
 
     local awk_script_file="$chunk_dir/script.awk"
     printf '%s\n' "$awk_code" > "$awk_script_file"
@@ -553,7 +882,7 @@ run_awk_parallel() {
         split -l "$lines_per_chunk" "$infile" "$chunk_dir/chunk_"
     fi
 
-    # Список усіх чанків
+    # List of all chunks
     local chunks=()
     local f
     for f in "$chunk_dir"/chunk_*; do
@@ -564,7 +893,7 @@ run_awk_parallel() {
     local total=${#chunks[@]}
     echo "[*] Parallel: ${nproc_cmd} cores, ${total} chunks (~${lines_per_chunk} lines)" >&2
 
-    # Прогрес-бар
+    # Progress bar
     print_progress() {
         local done=$1
         local total=$2
@@ -579,65 +908,101 @@ run_awk_parallel() {
         printf "\r[*] [%s] %3d%% (%d/%d) " "$bar" "$percent" "$done" "$total" >&2
     }
 
+    # Uses `wait -n` to reap finished children (kill -0 polling can't tell
+    # zombies from running processes, which caused the pool to hang). Falls
+    # back to `jobs -pr` on bash without `wait -n` (e.g. macOS system bash).
     local next=0
-    local running=0
     local finished=0
-    local pids=""
+    local -a pids=()
 
-    # Головний цикл
-    while [ $finished -lt $total ]; do
+    local supports_wait_n=false
+    if help wait 2>/dev/null | grep -q -- '-n'; then
+        supports_wait_n=true
+    fi
 
-        # Запускаємо нові задачі, поки є вільні слоти
-        while [ $running -lt "$nproc_cmd" ] && [ $next -lt $total ]; do
+    _awk_pool_launch_more() {
+        while [ "$next" -lt "$total" ] && [ "${#pids[@]}" -lt "$nproc_cmd" ]; do
             local chunk="${chunks[$next]}"
             next=$((next + 1))
-
             (
-                awk -f "$awk_script_file" "$chunk" > "${chunk}.out"
+                bb awk -f "$awk_script_file" "$chunk" > "${chunk}.out"
                 rm -f "$chunk"
             ) &
-            # Зберігаємо PID просто рядком
-            pids="$pids $!"
-            running=$((running + 1))
+            pids+=("$!")
         done
+    }
 
-        # Перевіряємо, хто вже закінчив
-        local new_pids=""
-        local pid
-        for pid in $pids; do
-            if kill -0 "$pid" 2>/dev/null; then
-                new_pids="$new_pids $pid"
-            else
-                wait "$pid" 2>/dev/null
-                running=$((running - 1))
-                finished=$((finished + 1))
-                print_progress "$finished" "$total"
-            fi
+    _awk_pool_launch_more
+
+    if [ "$supports_wait_n" = true ]; then
+        while [ "${#pids[@]}" -gt 0 ]; do
+            wait -n "${pids[@]}" 2>/dev/null
+            local still=() pid
+            for pid in "${pids[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    still+=("$pid")
+                else
+                    finished=$((finished + 1))
+                    print_progress "$finished" "$total"
+                fi
+            done
+            pids=("${still[@]}")
+            _awk_pool_launch_more
         done
-        pids="$new_pids"
-
-        # Якщо ніхто не закінчив — трохи чекаємо
-        if [ $running -ge "$nproc_cmd" ] || [ $next -ge $total ]; then
-            sleep 0.2
-        fi
-    done
+    else
+        while [ "${#pids[@]}" -gt 0 ]; do
+            sleep 0.1
+            local running_now still=() pid
+            running_now=" $(jobs -pr 2>/dev/null) "
+            for pid in "${pids[@]}"; do
+                case "$running_now" in
+                    *" $pid "*) still+=("$pid") ;;
+                    *)
+                        wait "$pid" 2>/dev/null
+                        finished=$((finished + 1))
+                        print_progress "$finished" "$total"
+                        ;;
+                esac
+            done
+            pids=("${still[@]}")
+            _awk_pool_launch_more
+        done
+    fi
 
     printf "\n[*] All chunks finished, merging...\n" >&2
 
     cat $(find "$chunk_dir" -name 'chunk_*.out' | sort) > "$outfile" 2>/dev/null
     echo "[*] Done." >&2
 
+    rm -rf "$chunk_dir" 2>/dev/null
     return 0
 }
 
 compile_signatures() {
     local sig_input="$1"
     local out_dir="$2"
-    local compiled_flag="$sig_input/.compiled"
+    # FIX: the compiled artifacts (sha256.tsv, hex_ere.txt, ...) always land
+    # in out_dir, which is a fresh EPHEMERAL work directory created per run
+    # (/dev/shm/av_scan_$$). The old skip-check compared a flag file's mtime
+    # against sig_input's mtime and, on "fresh enough", returned early
+    # WITHOUT ever populating out_dir — meaning a positive cache hit would
+    # leave the scan with zero signatures loaded. It also touch'd the flag
+    # file INSIDE sig_input, which updates sig_input's own mtime as the same
+    # operation, so flag-mtime == dir-mtime and "-nt" (strictly newer) was
+    # always false anyway — the cache never activated here, just recompiled
+    # every run (safe but wasteful, not silently broken). Either way, a
+    # PERSISTENT cache dir (survives between runs, unlike out_dir) is the
+    # correct fix: on a cache hit we copy from it into out_dir, so out_dir
+    # is always populated one way or another.
+    local cache_dir="$sig_input/.cache"
+    local compiled_flag="$cache_dir/.compiled"
 
-    # Якщо бази вже скомпільовані і не було примусового оновлення (-u) — пропускаємо
     if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ "$compiled_flag" -nt "$sig_input" ]; then
-        echo -e "[*] Signatures are already compiled and up to date."
+        echo -e "[*] Signatures already compiled -> reusing cache ($cache_dir)"
+        mkdir -p "$out_dir"
+        cp -f "$cache_dir"/sha256.tsv "$cache_dir"/md5.tsv "$cache_dir"/hex_ere.txt \
+              "$cache_dir"/strings.txt "$cache_dir"/b64_payloads.tsv "$out_dir/" 2>/dev/null || true
+        [ -d "$cache_dir/yara" ] && cp -rf "$cache_dir/yara" "$out_dir/" 2>/dev/null
         return 0
     fi
 
@@ -662,45 +1027,288 @@ EOF
 
     local sig_files=()
     if [ -d "$sig_input" ]; then
-        # Збираємо суворо ТЕКСТОВІ бази сигнатур, ігноруючи .git, yara, custom та бінарні файли
+        # Collect only text signature files, skip .git, yara, custom, and
+        # non-actionable ClamAV extensions (PE-section hashes, container
+        # sigs, icon hashes, domain/URL sigs, fuzzy hashes, and — important
+        # — .fp/.sfp which are KNOWN-CLEAN whitelists, not malware sigs).
+        # See "MODULE: ClamAV format support" below for details.
         while IFS= read -r -d '' sf; do
             sig_files+=("$sf")
-        done < <(find "$sig_input" -type f \
+        done < <(bb find "$sig_input" -type f \
             -not -path '*/.git/*' \
             -not -path '*/yara/*' \
             -not -path '*/custom/*' \
+            -not -path '*/.cache/*' \
             -not -name "*.pack" -not -name "*.idx" -not -name "*.cvd" \
             -not -name "*.yarc" -not -name "*.compiled" \
+            -not -name "*.mdb" -not -name "*.mdu" \
+            -not -name "*.msb" -not -name "*.msu" \
+            -not -name "*.cdb" -not -name "*.idb" -not -name "*.wdb" \
+            -not -name "*.pdb" -not -name "*.gdb" -not -name "*.ftm" \
+            -not -name "*.fp" -not -name "*.sfp" \
+            -not -name "*.ign" -not -name "*.ign2" \
+            -not -name "*.info" -not -name "*.cfg" -not -name "*.crb" \
+            -not -name "*.cdiff" \
             -print0 2>/dev/null)
     else
         sig_files+=("$sig_input")
     fi
 
-    # Advanced parser (виклики awk виконуються тільки на валідних текстових базах)
-    if [ ${#sig_files[@]} -gt 0 ]; then
-        # 1. Створюємо один об'єднаний список файлів для обробки
-        local tmp_inputlist="$out_dir/sig_files.tmp"
-        printf "%s\n" "${sig_files[@]}" > "$tmp_inputlist"
+    # ============================================================================
+    # MODULE: ClamAV format support
+    #
+    # ClamAV signature files are a family of formats, not one — files are
+    # routed by extension to a dedicated parser per format.
+    #
+    # Supported:
+    #   .hdb/.hdu, .hsb/.hsu — file hashes (MD5/SHA256)
+    #   .ndb/.ndu            — extended hex signatures with gap quantifiers:
+    #                           {n}, {n-m}, {-n}, {n-}, ??, *, (aa|bb) —
+    #                           compiled into YARA hex-string rules, not
+    #                           grep -E patterns (see note below)
+    #   .ldb/.ldu             — logical signatures: subsignatures AND their
+    #                           boolean AND/OR expression are reconstructed
+    #                           as a proper YARA rule (condition), so match
+    #                           precision matches real ClamAV, not a
+    #                           degraded "any fragment matches" heuristic
+    #
+    # Intentionally NOT supported (excluded above, not silently dropped):
+    #   .mdb/.mdu, .msb/.msu — PE SECTION hashes, not whole-file hashes.
+    #                          Without a PE parser these would never match
+    #                          anything, so they're excluded rather than
+    #                          wired in incorrectly.
+    #   .cdb, .idb            — container signatures / icon hashes, need an
+    #                          archive/PE-resource parser we don't have.
+    #   .wdb, .pdb, .gdb       — domain/URL signatures, not file content.
+    #   .ftm                   — fuzzy hashes (need distance calc, not us).
+    #   .fp, .sfp              — KNOWN-CLEAN whitelists, not malware sigs.
+    #
+    # WHY YARA INSTEAD OF grep -E: a real ClamAV .ndb+.ldb set is tens to
+    # hundreds of thousands of hex patterns. grep -E -f rebuilds its match
+    # automaton from every pattern on EVERY invocation — empirically, just
+    # 10,000 patterns took 4.5s to build ONCE, and 200,000 timed out past
+    # 30s. That made scanning thousands of files effectively hang. YARA is
+    # built for exactly this (multi-pattern matching at malware-database
+    # scale): a compiled ruleset of 50,000 rules loads and matches 500
+    # files in under a second. NDB/LDB signatures are compiled into a YARA
+    # rules file here, then yarac'd into one binary ruleset alongside any
+    # externally-fetched YARA rules (see below), and matched through the
+    # same batched process_yara_batch() used for hand-written YARA rules.
+    # LDB subsignatures that use PCRE (start with "/") are skipped —
+    # PCRE-in-YARA is a distinct syntax we don't attempt to convert; a rule
+    # referencing a skipped subsignature is dropped entirely rather than
+    # emitting a broken condition.
+    # ============================================================================
 
-        # 2. Скрипт awk (код той самий, але пише в стандартний вивід STDOUT з префіксом типу)
-        local awk_script='
-            function hex2ere(s, a, p) {
-                s = tolower(s)
-                gsub(/[^0-9a-f?*{}|()]/, "", s)
-                if (length(s) < 8) return ""
-                gsub(/\?\?/, "..", s)
-                gsub(/\*/, ".*", s)
-                while (match(s, /\{[0-9]+(-[0-9]+)?\}/)) {
-                    p = substr(s, RSTART+1, RLENGTH-2)
-                    if (index(p, "-")) {
-                        split(p, a, "-")
-                        sub(/\{[0-9]+-[0-9]+\}/, ".{" (2*a[1]) "," (2*a[2]) "}", s)
-                    } else {
-                        sub(/\{[0-9]+\}/, ".{" (2*p) "}", s)
+    local hash_files=() ndb_files=() ldb_files=() generic_files=()
+    local sf ext
+    for sf in "${sig_files[@]}"; do
+        ext="${sf##*.}"
+        case "${ext,,}" in
+            hdb|hdu|hsb|hsu) hash_files+=("$sf") ;;
+            ndb|ndu)         ndb_files+=("$sf") ;;
+            ldb|ldu)         ldb_files+=("$sf") ;;
+            *)               generic_files+=("$sf") ;;
+        esac
+    done
+
+    # Shared NDB/LDB helper: converts a ClamAV hex signature into a YARA
+    # hex-string token sequence (space-separated bytes / ?? / [n] / [n-m] /
+    # [n-] / [0-m] / ( aa | bb ) alternation groups). Unlike the old ERE
+    # path, jump distances stay EXACT — YARA is built to handle this at
+    # scale, so there is no need to loosen them to "any distance".
+    local ndb2yara_fn='
+        function ndb2yara(raw,    s, out, i, c, n, buf, j, spec, inner, alts, cnt, k, a, pa, m, alt_out) {
+            s = tolower(raw)
+            gsub(/[ \t]+/, "", s)
+            n = length(s)
+            out = ""
+            buf = ""
+            i = 1
+            while (i <= n) {
+                c = substr(s, i, 1)
+                if (substr(s, i, 2) == "??") {
+                    out = out "?? "
+                    i += 2
+                } else if (c == "*") {
+                    out = out "[0-] "
+                    i += 1
+                } else if (c == "{") {
+                    j = index(substr(s, i), "}")
+                    if (j == 0) { i = n + 1 } else {
+                        spec = substr(s, i + 1, j - 2)
+                        if (spec ~ /^[0-9]+$/) out = out "[" spec "] "
+                        else if (spec ~ /^[0-9]+-[0-9]+$/) out = out "[" spec "] "
+                        else if (spec ~ /^[0-9]+-$/) out = out "[" spec "] "
+                        else if (spec ~ /^-[0-9]+$/) out = out "[0" spec "] "
+                        i += j
                     }
+                } else if (c == "(") {
+                    j = index(substr(s, i), ")")
+                    if (j == 0) { i = n + 1 } else {
+                        inner = substr(s, i + 1, j - 2)
+                        cnt = split(inner, alts, "|")
+                        alt_out = ""
+                        for (k = 1; k <= cnt; k++) {
+                            a = alts[k]
+                            pa = ""
+                            for (m = 1; m <= length(a); m += 2) pa = pa substr(a, m, 2) " "
+                            gsub(/ +$/, "", pa)
+                            alt_out = (alt_out == "" ? pa : alt_out " | " pa)
+                        }
+                        out = out "( " alt_out " ) "
+                        i += j
+                    }
+                } else if (c ~ /[0-9a-f]/) {
+                    buf = buf c
+                    if (length(buf) == 2) { out = out buf " "; buf = "" }
+                    i += 1
+                } else {
+                    i += 1
                 }
-                return s
             }
+            gsub(/ +$/, "", out)
+            return out
+        }
+        function yara_rule_name(base,    r) {
+            r = base
+            gsub(/[^a-zA-Z0-9_]/, "_", r)
+            return "s_" r
+        }
+    '
+
+    # GENERIC category fallback still uses the ERE-based approach (low
+    # volume — custom/misc files, not the bulk .ndb/.ldb databases — so
+    # grep -E -f's per-pattern-count cost isn't a practical problem here).
+    local hex2ere_fn='
+        function hex2ere(s, a, p, guard, n) {
+            s = tolower(s)
+            gsub(/[^0-9a-f?*{}|()-]/, "", s)
+            if (length(s) < 8) return ""
+            gsub(/\?\?/, "..", s)
+            gsub(/\*/, ".*", s)
+            guard = 0
+            while (match(s, /\{(-[0-9]+|[0-9]+-[0-9]+|[0-9]+-|[0-9]+)\}/)) {
+                guard++
+                if (guard > 1000) { return "" }
+                sub(/\{(-[0-9]+|[0-9]+-[0-9]+|[0-9]+-|[0-9]+)\}/, "@GAPSTAR@", s)
+            }
+            gsub(/@GAPSTAR@/, ".*", s)
+            return s
+        }
+    '
+
+    local tmp_raw_sigs="$out_dir/raw_compiled.tmp"
+    : > "$tmp_raw_sigs"
+    mkdir -p "$out_dir/yara"
+    local tmp_yara_rules="$out_dir/yara/generated_ndb_ldb.yar"
+    : > "$tmp_yara_rules"
+
+    # --- HASH category (.hdb/.hdu/.hsb/.hsu): "hash:size:name" ---
+    if [ ${#hash_files[@]} -gt 0 ]; then
+        local tmp_hash="$out_dir/cat_hash.tmp" tmp_hash_out="$out_dir/cat_hash.out"
+        cat "${hash_files[@]}" > "$tmp_hash"
+        run_awk_parallel "$tmp_hash" "$tmp_hash_out" '
+            {
+                line = $0
+                sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+                if (line == "" || line ~ /^#/) next
+                n = split(line, a, ":")
+                if (n < 1) next
+                h = tolower(a[1])
+                name = (n >= 3 ? a[3] : "ClamAV.Hash")
+                if (h ~ /^[0-9a-f]{64}$/) print "SHA256\t" h "\t" name
+                else if (h ~ /^[0-9a-f]{32}$/) print "MD5\t" h "\t" name
+            }
+        '
+        cat "$tmp_hash_out" >> "$tmp_raw_sigs"
+        rm -f "$tmp_hash" "$tmp_hash_out"
+    fi
+
+    # --- NDB category (.ndb/.ndu): "Name:Type:Offset:HexSig[:MinFL:MaxFL]" ---
+    # The hex signature is always field 4, not "the last field" — optional
+    # trailing :MinFL:MaxFL would otherwise shift it out. Compiled into a
+    # YARA rule per signature (see MODULE: ClamAV format support above).
+    if [ ${#ndb_files[@]} -gt 0 ]; then
+        local tmp_ndb="$out_dir/cat_ndb.tmp" tmp_ndb_out="$out_dir/cat_ndb.out"
+        cat "${ndb_files[@]}" > "$tmp_ndb"
+        run_awk_parallel "$tmp_ndb" "$tmp_ndb_out" "$ndb2yara_fn"'
+            {
+                line = $0
+                sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+                if (line == "" || line ~ /^#/) next
+                n = split(line, a, ":")
+                if (n < 4) next
+                yhex = ndb2yara(a[4])
+                if (yhex == "" || length(yhex) < 8) next
+                rname = yara_rule_name("ndb_" FILENAME "_" NR)
+                print "YARARULE\trule " rname " { strings: $a = { " yhex " } condition: $a }"
+            }
+        '
+        cat "$tmp_ndb_out" >> "$tmp_raw_sigs"
+        rm -f "$tmp_ndb" "$tmp_ndb_out"
+    fi
+
+    # --- LDB category (.ldb/.ldu): "Name:Type:Expression:Subsig0:Subsig1:..." ---
+    # Unlike the old grep-based approach, the boolean AND/OR expression
+    # (field 3) is now reconstructed as a real YARA condition instead of
+    # being dropped — e.g. ClamAV "(0&1)|2" becomes YARA "($s0 and $s1) or
+    # $s2". A rule is skipped entirely (not partially emitted) if any of
+    # its subsignatures is PCRE-based ("/pattern/") or fails to convert,
+    # since a condition referencing a missing $sN would be a broken rule.
+    if [ ${#ldb_files[@]} -gt 0 ]; then
+        local tmp_ldb="$out_dir/cat_ldb.tmp" tmp_ldb_out="$out_dir/cat_ldb.out"
+        cat "${ldb_files[@]}" > "$tmp_ldb"
+        run_awk_parallel "$tmp_ldb" "$tmp_ldb_out" "$ndb2yara_fn"'
+            function translate_condition(expr,    out2, j, L, ch, numstr) {
+                out2 = ""
+                j = 1
+                L = length(expr)
+                while (j <= L) {
+                    ch = substr(expr, j, 1)
+                    if (ch ~ /[0-9]/) {
+                        numstr = ch
+                        j++
+                        while (j <= L && substr(expr, j, 1) ~ /[0-9]/) { numstr = numstr substr(expr, j, 1); j++ }
+                        out2 = out2 "$s" numstr
+                    } else if (ch == "&") { out2 = out2 " and "; j++ }
+                    else if (ch == "|") { out2 = out2 " or "; j++ }
+                    else { out2 = out2 ch; j++ }
+                }
+                return out2
+            }
+            {
+                line = $0
+                sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+                if (line == "" || line ~ /^#/) next
+                n = split(line, a, ":")
+                if (n < 4) next
+                ok = 1
+                strs = ""
+                for (i = 4; i <= n; i++) {
+                    if (a[i] ~ /^\//) { ok = 0; break }
+                    yhex = ndb2yara(a[i])
+                    if (yhex == "" || length(yhex) < 8) { ok = 0; break }
+                    strs = strs "$s" (i - 4) " = { " yhex " } "
+                }
+                if (!ok) next
+                cond = translate_condition(a[3])
+                if (cond == "") next
+                rname = yara_rule_name("ldb_" FILENAME "_" NR)
+                print "YARARULE\trule " rname " { strings: " strs "condition: " cond " }"
+            }
+        '
+        cat "$tmp_ldb_out" >> "$tmp_raw_sigs"
+        rm -f "$tmp_ldb" "$tmp_ldb_out"
+    fi
+
+    # --- GENERIC category: everything else (custom.*, maldet's own bare-hash
+    # formats like md5.dat/sha256v2.dat, our sha256:/str:/b64sig: DSL) — same
+    # content-guessing approach as before, plus bare-hash support.
+    if [ ${#generic_files[@]} -gt 0 ]; then
+        local tmp_generic="$out_dir/cat_generic.tmp" tmp_generic_out="$out_dir/cat_generic.out"
+        cat "${generic_files[@]}" > "$tmp_generic"
+        run_awk_parallel "$tmp_generic" "$tmp_generic_out" "$hex2ere_fn"'
             {
                 line = $0
                 sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
@@ -718,7 +1326,19 @@ EOF
                     print "B64\t" substr(line, 8) "\tCustom.B64"
                     next
                 }
-                # ClamAV / Maldet hashes
+                # Bare hash (e.g. maldet md5.dat/sha256v2.dat: one hash per
+                # line, optionally with a name after ":")
+                if (line ~ /^[0-9a-fA-F]{64}(:.*)?$/) {
+                    split(line, a, ":")
+                    print "SHA256\t" tolower(a[1]) "\t" (a[2] != "" ? a[2] : "Maldet.Hash")
+                    next
+                }
+                if (line ~ /^[0-9a-fA-F]{32}(:.*)?$/) {
+                    split(line, a, ":")
+                    print "MD5\t" tolower(a[1]) "\t" (a[2] != "" ? a[2] : "Maldet.Hash")
+                    next
+                }
+                # ClamAV/Maldet-style "hash:size:name"
                 if (line ~ /^[0-9a-fA-F]{32,64}:[0-9*]+:/) {
                     split(line, a, ":")
                     h = tolower(a[1]); name = a[3]
@@ -726,7 +1346,7 @@ EOF
                     else if (length(h) == 32) print "MD5\t" h "\t" name
                     next
                 }
-                # Hex signatures
+                # Loosest fallback: last field looks like a hex signature
                 if (line ~ /:[0-9]+:[0-9*a-fA-F>=-]*:/ || line ~ /:[0-9a-fA-F?*{}|()]{10,}$/) {
                     n = split(line, a, ":")
                     if (length(a[n]) >= 8) {
@@ -737,44 +1357,86 @@ EOF
                 }
             }
         '
-
-        # 3. Об'єднуємо вміст усіх файлів баз і проганяємо через паралельний awk
-        local tmp_raw_sigs="$out_dir/raw_compiled.tmp"
-        
-        # Об'єднуємо файли в один потік і паралелимо його
-        cat "${sig_files[@]}" > "$out_dir/merged_sigs.tmp"
-        run_awk_parallel "$out_dir/merged_sigs.tmp" "$tmp_raw_sigs" "$awk_script"
-
-        # 4. Розкладаємо оброблений потік по відповідних файлах (.tsv / .txt)
-        awk -F'\t' -v out="$out_dir" '
-            $1 == "SHA256" { print $2 "\t" $3 >> (out "/sha256.tsv") }
-            $1 == "MD5"    { print $2 "\t" $3 >> (out "/md5.tsv") }
-            $1 == "STR"    { print $2 >> (out "/strings.txt") }
-            $1 == "B64"    { print $2 "\t" $3 >> (out "/b64_payloads.tsv") }
-            $1 == "HEX"    { print $2 >> (out "/hex_ere.txt") }
-        ' "$tmp_raw_sigs"
-
-        # Прибирання тимчасових файлів
-        rm -f "$out_dir/merged_sigs.tmp" "$tmp_raw_sigs" "$tmp_inputlist"
+        cat "$tmp_generic_out" >> "$tmp_raw_sigs"
+        rm -f "$tmp_generic" "$tmp_generic_out"
     fi
 
+    if [ -s "$tmp_raw_sigs" ]; then
+        # Distribute the merged processed stream into the .tsv/.txt/.yar outputs
+        bb awk -F'\t' -v out="$out_dir" '
+            $1 == "SHA256"   { print $2 "\t" $3 >> (out "/sha256.tsv") }
+            $1 == "MD5"      { print $2 "\t" $3 >> (out "/md5.tsv") }
+            $1 == "STR"      { print $2 >> (out "/strings.txt") }
+            $1 == "B64"      { print $2 "\t" $3 >> (out "/b64_payloads.tsv") }
+            $1 == "HEX"      { print $2 >> (out "/hex_ere.txt") }
+            $1 == "YARARULE" { print $2 >> (out "/yara/generated_ndb_ldb.yar") }
+        ' "$tmp_raw_sigs"
+    fi
+    rm -f "$tmp_raw_sigs"
+
     # External hash lists
-    find "$sig_input" -not -path '*/.git/*' \( -name "*.sha256" -o -name "malwarebazaar.sha256" \) 2>/dev/null | while read -r f; do
-        [ -s "$f" ] && awk '{print $1 "\t" ($2 ? $2 : "External.Hash")}' "$f" >> "$out_dir/sha256.tsv"
+    bb find "$sig_input" -not -path '*/.git/*' \( -name "*.sha256" -o -name "malwarebazaar.sha256" \) 2>/dev/null | while read -r f; do
+        [ -s "$f" ] && bb awk '{print $1 "\t" ($2 ? $2 : "External.Hash")}' "$f" >> "$out_dir/sha256.tsv"
     done
 
-    # YARA
+    # YARA: gather external rule sources (fetched during -u) plus our own
+    # generated NDB/LDB rules, and compile them ALL into one ruleset here —
+    # so every worker just loads a single pre-compiled rules.yarc instead
+    # of each re-parsing rule text from scratch (see MODULE: ClamAV format
+    # support above for why this matters at scale).
     mkdir -p "$out_dir/yara"
     if [ -d "$sig_input/yara" ]; then
-        if [ -f "$sig_input/yara/rules.yarc" ]; then
-            cp "$sig_input/yara/rules.yarc" "$out_dir/yara/" 2>/dev/null || true
-        fi
-        if [ -f "$sig_input/yara/index.yar" ]; then
-            cp "$sig_input/yara/index.yar" "$out_dir/yara/" 2>/dev/null || true
-        fi
-        find "$sig_input/yara" -not -path '*/.git/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | head -200 | while read -r yf; do
+        bb find "$sig_input/yara" -not -path '*/.git/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | head -200 | while read -r yf; do
             cp "$yf" "$out_dir/yara/" 2>/dev/null || true
         done
+    fi
+
+    # "filename"/"filepath"/"extension" are external variables in modern
+    # YARA (not automatic built-ins) — plenty of real-world rules reference
+    # them, and compilation fails outright if they aren't declared. Empty
+    # defaults are fine: this scanner batches many files per yara call, so
+    # there's no single "current filename" to give them anyway; rules that
+    # depend on a real value just won't match on that condition.
+    local yara_extvars=(-d filename= -d filepath= -d extension=)
+
+    local yar_sources
+    yar_sources=$(bb find "$out_dir/yara" -maxdepth 1 \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null)
+    if [ -n "$yar_sources" ] && [ -n "$YARAC_BIN" ]; then
+        # Validate each file in ISOLATION first and only include the ones
+        # that compile cleanly — one incompatible rule (unsupported module,
+        # syntax our yarac build doesn't handle) would otherwise fail the
+        # ENTIRE combined ruleset and silently disable all YARA detection,
+        # including our own generated NDB/LDB rules.
+        local yara_index="$out_dir/yara/_index.yar"
+        local skipped=0 included=0
+        : > "$yara_index"
+        while IFS= read -r yf; do
+            [ -z "$yf" ] && continue
+            if "$YARAC_BIN" "${yara_extvars[@]}" "$yf" /dev/null &>/dev/null; then
+                echo "include \"$yf\"" >> "$yara_index"
+                included=$((included + 1))
+            else
+                skipped=$((skipped + 1))
+            fi
+        done <<< "$yar_sources"
+        [ "$skipped" -gt 0 ] && echo -e "${Y}[WARN] Skipped ${skipped} incompatible YARA rule file(s) (unsupported module/syntax) — ${included} included${Z}"
+
+        if [ -s "$yara_index" ] && "$YARAC_BIN" "${yara_extvars[@]}" "$yara_index" "$out_dir/yara/rules.yarc" 2>/dev/null; then
+            :
+        else
+            echo -e "${Y}[WARN] yarac failed on the combined ruleset -> falling back to source (slower)${Z}"
+            rm -f "$out_dir/yara/rules.yarc" 2>/dev/null
+            mv -f "$yara_index" "$out_dir/yara/index.yar" 2>/dev/null
+        fi
+        rm -f "$yara_index"
+    elif [ -n "$yar_sources" ]; then
+        # No yarac available: fall back to an include-index the worker can
+        # load as source (works, just recompiles from text on every call).
+        local yara_index="$out_dir/yara/index.yar"
+        : > "$yara_index"
+        while IFS= read -r yf; do
+            [ -n "$yf" ] && echo "include \"$yf\"" >> "$yara_index"
+        done <<< "$yar_sources"
     fi
 
     # Base64 -> SHA256 precompute
@@ -794,25 +1456,45 @@ EOF
     if [ -d "$sig_input/custom" ]; then cdir="$sig_input/custom"
     elif [ -d "$SIG_DIR/custom" ]; then cdir="$SIG_DIR/custom"; fi
     if [ -n "$cdir" ] && [ -d "$cdir" ]; then
-        find "$cdir" -name "*.md5" -exec cat {} + 2>/dev/null >> "$out_dir/md5.tsv" || true
-        find "$cdir" -name "*.sha256" -exec cat {} + 2>/dev/null >> "$out_dir/sha256.tsv" || true
-        find "$cdir" -name "*.strings" -exec cat {} + 2>/dev/null >> "$out_dir/strings.txt" || true
+        bb find "$cdir" -name "*.md5" -exec cat {} + 2>/dev/null >> "$out_dir/md5.tsv" || true
+        bb find "$cdir" -name "*.sha256" -exec cat {} + 2>/dev/null >> "$out_dir/sha256.tsv" || true
+        bb find "$cdir" -name "*.strings" -exec cat {} + 2>/dev/null >> "$out_dir/strings.txt" || true
         echo "  ✓ Custom signatures loaded"
     fi
 
-    # Dedup (Виключено hex_ere.txt з sort -u, щоб не навантажувати CPU марним сортуванням Regex)
-    for f in sha256.tsv md5.tsv strings.txt b64_payloads.tsv; do
-        [ -s "$out_dir/$f" ] && sort -u "$out_dir/$f" -o "$out_dir/$f" 2>/dev/null || true
+    # Dedup (also collapses now-common ".*"-only variants of what used to be
+    # distinct bounded-quantifier patterns)
+    for f in sha256.tsv md5.tsv strings.txt b64_payloads.tsv hex_ere.txt; do
+        [ -s "$out_dir/$f" ] && bb sort -u "$out_dir/$f" -o "$out_dir/$f" 2>/dev/null || true
     done
 
-    # Ставимо прапорець успішної компіляції
+    # Cap hex_ere.txt: grep -E -f builds its match automaton from ALL
+    # patterns on every call. A full real ClamAV .ndb+.ldb set is hundreds
+    # of thousands of patterns — tested empirically, that alone can take
+    # 30+ SECONDS to build per call, regardless of batching. Keep it small
+    # enough that even a fresh automaton build stays sub-second.
+    if [ -s "$out_dir/hex_ere.txt" ]; then
+        local hex_count
+        hex_count=$(bb wc -l < "$out_dir/hex_ere.txt" 2>/dev/null | tr -d ' ')
+        if [ "${hex_count:-0}" -gt "$MAX_HEX_PATTERNS" ]; then
+            echo -e "${Y}[WARN] hex_ere.txt has ${hex_count} patterns, capping to ${MAX_HEX_PATTERNS} (--max-hex-patterns to change) — coverage reduced, but grep -E -f cannot build a usable automaton from the full set${Z}"
+            head -n "$MAX_HEX_PATTERNS" "$out_dir/hex_ere.txt" > "$out_dir/hex_ere.txt.tmp" && mv -f "$out_dir/hex_ere.txt.tmp" "$out_dir/hex_ere.txt"
+        fi
+    fi
+
+    # Save compiled artifacts to the persistent cache so the next run can
+    # reuse them without recompiling (see comment at the top of this function)
+    mkdir -p "$cache_dir"
+    cp -f "$out_dir"/sha256.tsv "$out_dir"/md5.tsv "$out_dir"/hex_ere.txt \
+          "$out_dir"/strings.txt "$out_dir"/b64_payloads.tsv "$cache_dir/" 2>/dev/null || true
+    [ -d "$out_dir/yara" ] && cp -rf "$out_dir/yara" "$cache_dir/" 2>/dev/null
     touch "$compiled_flag" 2>/dev/null || true
 
-    echo -e "  SHA256 : ${C}$(wc -l < "$out_dir/sha256.tsv" 2>/dev/null | tr -d ' ')${Z}"
-    echo -e "  MD5    : ${C}$(wc -l < "$out_dir/md5.tsv" 2>/dev/null | tr -d ' ')${Z}"
-    echo -e "  HexERE : ${C}$(wc -l < "$out_dir/hex_ere.txt" 2>/dev/null | tr -d ' ')${Z}"
-    echo -e "  Strings: ${C}$(wc -l < "$out_dir/strings.txt" 2>/dev/null | tr -d ' ')${Z}"
-    echo -e "  YARA   : ${C}$(find "$out_dir/yara" -name "*.ya*" 2>/dev/null | wc -l | tr -d ' ')${Z}"
+    echo -e "  SHA256 : ${C}$(bb wc -l < "$out_dir/sha256.tsv" 2>/dev/null | tr -d ' ')${Z}"
+    echo -e "  MD5    : ${C}$(bb wc -l < "$out_dir/md5.tsv" 2>/dev/null | tr -d ' ')${Z}"
+    echo -e "  HexERE : ${C}$(bb wc -l < "$out_dir/hex_ere.txt" 2>/dev/null | tr -d ' ')${Z}"
+    echo -e "  Strings: ${C}$(bb wc -l < "$out_dir/strings.txt" 2>/dev/null | tr -d ' ')${Z}"
+    echo -e "  YARA   : ${C}$(bb find "$out_dir/yara" -name "*.ya*" 2>/dev/null | bb wc -l | tr -d ' ')${Z}"
     echo ""
 }
 
@@ -852,11 +1534,16 @@ extract_worker() {
 # 11. MODULE: dependency check
 # ============================================================================
 check_deps() {
+    # Check via bb() first (busybox if available, else system) — matches
+    # what the script actually uses at runtime.
     local miss=()
-    for cmd in bash find awk grep od dd cut tr wc; do
+    for cmd in find awk grep od dd cut tr wc; do
+        if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet "$cmd"; then
+            continue
+        fi
         command -v "$cmd" &>/dev/null || miss+=("$cmd")
     done
-    [ ${#miss[@]} -gt 0 ] && { echo -e "${R}[FAIL] Missing: ${miss[*]}${Z}"; exit 1; }
+    [ ${#miss[@]} -gt 0 ] && { echo -e "${R}[FAIL] Missing required tools (not in busybox or system): ${miss[*]}${Z}"; exit 1; }
 }
 
 # ============================================================================
@@ -872,14 +1559,21 @@ print_banner() {
     echo -e " Max size     : ${C}${MAX_SCAN_MB} MB${Z}"
     echo -e " SHA256 / MD5 : ${C}${SHA256_CMD} / ${MD5_CMD}${Z}"
     echo -e " YARA         : ${C}${YARA_CMD}${Z}"
-    echo -e " strings/file : ${C}${STRINGS_CMD} / ${FILE_CMD}${Z}"
+    echo -e " strings/file : ${C}${STRINGS_CMD} / built-in magic-bytes${Z}"
+    if [ -n "$BUSYBOX_BIN" ]; then
+        echo -e " BusyBox      : ${G}ON${Z} -> ${BUSYBOX_BIN}"
+    elif [ "$ALLOW_BUSYBOX" = false ]; then
+        echo -e " BusyBox      : ${Y}off (--no-busybox, intentional)${Z}"
+    else
+        echo -e " BusyBox      : ${R}MISSING (system-only) — unusual, check the package${Z}"
+    fi
     if [ "$QUARANTINE_ENABLED" = true ]; then
         echo -e " Quarantine   : ${C}ON -> ${QUARANTINE_DIR} (perm ${QUARANTINE_PERM})${Z}"
     else
         echo -e " Quarantine   : off"
     fi
     if [ "$REALTIME_MODE" = true ]; then
-        echo -e " Real-time    : ${C}ON${Z} (стартує після базового скану)"
+        echo -e " Real-time    : ${C}ON${Z} (starts after the base scan)"
     fi
     echo -e "${B}=================================================${Z}"
 }
@@ -887,17 +1581,17 @@ print_banner() {
 collect_files() {
     echo -e "[*] Collecting file tree..."
     local excl=(-not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*")
-    if [ "$OS" = "linux" ] && find "$SCRIPT_DIR" -maxdepth 0 -printf "" 2>/dev/null; then
-        find "$ROOT_DIR" -type f "${excl[@]}" -printf "%s\t%m\t%p\n" 2>/dev/null > "$WORK_DIR/all_files.tsv"
+    if [ "$OS" = "linux" ] && bb find "$SCRIPT_DIR" -maxdepth 0 -printf "" 2>/dev/null; then
+        bb find "$ROOT_DIR" -type f "${excl[@]}" -printf "%s\t%m\t%p\n" 2>/dev/null > "$WORK_DIR/all_files.tsv"
     else
-        find "$ROOT_DIR" -type f "${excl[@]}" -print 2>/dev/null > "$WORK_DIR/all_files.tsv"
+        bb find "$ROOT_DIR" -type f "${excl[@]}" -print 2>/dev/null > "$WORK_DIR/all_files.tsv"
     fi
-    TOTAL_FILES=$(wc -l < "$WORK_DIR/all_files.tsv" | tr -d ' ')
+    TOTAL_FILES=$(bb wc -l < "$WORK_DIR/all_files.tsv" | tr -d ' ')
     echo -e "[*] Files queued: ${C}${TOTAL_FILES}${Z}\n"
 }
 
 split_pools() {
-    awk -v w="$WORKERS" -v d="$WORK_DIR/reports" '{ print > (d "/pool_" (NR % w) ".txt") }' "$WORK_DIR/all_files.tsv"
+    bb awk -v w="$WORKERS" -v d="$WORK_DIR/reports" '{ print > (d "/pool_" (NR % w) ".txt") }' "$WORK_DIR/all_files.tsv"
 }
 
 launch_workers() {
@@ -912,7 +1606,7 @@ launch_workers() {
             "$pool" "$wid" "$WORK_DIR/reports" \
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
             "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
-            "$qdir" "$QUARANTINE_PERM" &
+            "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" &
         WORKER_PIDS+=($!)
     done
 }
@@ -1017,8 +1711,8 @@ build_report() {
     local r f t
     for r in "$WORK_DIR/reports"/pool_*.txt; do
         [ -f "$r" ] || continue
-        f=$(grep "^FILES_SCANNED:" "$r" 2>/dev/null | cut -d: -f2)
-        t=$(grep "^THREATS_FOUND:" "$r" 2>/dev/null | cut -d: -f2)
+        f=$(bb grep "^FILES_SCANNED:" "$r" 2>/dev/null | cut -d: -f2)
+        t=$(bb grep "^THREATS_FOUND:" "$r" 2>/dev/null | cut -d: -f2)
         TF=$(( TF + ${f:-0} )); TT=$(( TT + ${t:-0} ))
     done
     SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
@@ -1048,8 +1742,8 @@ print_report() {
     if [ "$TT" -gt 0 ]; then
         echo -e "${R}${RPT}${Z}"
         echo -e "\n${R}${B}=== DETECTED THREATS ===${Z}"
-        grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null \
-            | cut -d: -f2- | sort -u \
+        bb grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null \
+            | cut -d: -f2- | bb sort -u \
             | while IFS='|' read -r type file info; do
                 echo -e " ${R}[!]${Z} [${Y}${type}${Z}] ${file} ${C}${info:-}${Z}"
               done
@@ -1065,32 +1759,30 @@ save_report() {
         echo "$RPT"
         [ "$TT" -gt 0 ] && {
             echo -e "\n=== DETECTED THREATS ==="
-            grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d: -f2- | sort -u
+            bb grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d: -f2- | bb sort -u
         }
     } > "$OUTPUT_FILE"
     echo -e "\n[*] Report saved: ${C}${OUTPUT_FILE}${Z}"
 }
 
 # ============================================================================
-# 15. MODULE: real-time watch (фоновий демон)
+# 15. MODULE: real-time watch (background daemon)
 #
-#     Ідея: замість дублювання логіки сканування, запускаємо ОДИН екземпляр
-#     того ж самого воркера (той самий файл WORKER_FILE, ті ж функції
-#     хешування/YARA/евристик/карантину), але замість статичного pool-файлу
-#     він читає шляхи з іменованого каналу (FIFO). "while read ... done < FIFO"
-#     у воркері автоматично блокується й чекає нових рядків — тобто воркер
-#     сам по собі вже є "нескінченним" процесом реального часу, нічого
-#     додатково писати в ньому не треба.
+#     Runs a single instance of the same worker (same WORKER_FILE, same
+#     hashing/YARA/heuristics/quarantine code), but reads paths from a FIFO
+#     instead of a static pool file. "while read ... done < FIFO" already
+#     blocks and waits for new lines, so the worker is inherently a
+#     long-running real-time process without extra code.
 #
-#     Головний скрипт лише постачає шляхи до нових файлів у FIFO:
-#       - якщо є inotifywait -> миттєво, по подіях файлової системи
-#       - інакше -> періодичний polling (find + порівняння з попереднім
-#         знімком) кожні WATCH_INTERVAL секунд
+#     The main script just feeds new file paths into the FIFO:
+#       - inotifywait if available -> instant, event-driven
+#       - otherwise -> polling (find + diff against previous snapshot)
+#         every WATCH_INTERVAL seconds
 # ============================================================================
 start_realtime_worker() {
     REALTIME_FIFO="$WORK_DIR/realtime.fifo"
     mkfifo "$REALTIME_FIFO" 2>/dev/null || {
-        echo -e "${R}[FAIL] Не вдалося створити FIFO для real-time режиму${Z}"
+        echo -e "${R}[FAIL] Could not create FIFO for real-time mode${Z}"
         return 1
     }
 
@@ -1100,19 +1792,17 @@ start_realtime_worker() {
     REALTIME_REPORT="$WORK_DIR/reports/rt.txt"
     : > "$REALTIME_REPORT"
 
-    # Воркер відкриє FIFO на читання і забльокується всередині свого звичного
-    # run_scan_loop(), очікуючи нові рядки-шляхи.
+    # The worker opens the FIFO for reading and blocks inside its usual
+    # run_scan_loop(), waiting for new path lines.
     bash "$WORKER_FILE" \
         "$REALTIME_FIFO" "rt" "$WORK_DIR/reports" \
         "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
         "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
-        "$qdir" "$QUARANTINE_PERM" &
+        "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" &
     REALTIME_WORKER_PID=$!
 
-    # Тримаємо дескриптор на запис відкритим постійно (fd 3). Якщо відкривати
-    # FIFO на запис окремо для кожного нового файлу, кожен виклик блокуватиме
-    # до появи читача і зашумлятиме логіку — набагато простіше й надійніше
-    # тримати один довгоживучий канал запису.
+    # Keep the write fd (3) open permanently — opening/closing per event
+    # would block until a reader shows up each time.
     exec 3> "$REALTIME_FIFO"
 }
 
@@ -1122,7 +1812,7 @@ feed_realtime_path() {
     printf '%s\n' "$path" >&3 2>/dev/null || true
 }
 
-# Виводить нові THREAT-рядки з живого звіту воркера прямо в консоль
+# Streams new THREAT lines from the worker's live report to the console
 tail_realtime_report() {
     tail -n0 -F "$REALTIME_REPORT" 2>/dev/null | while IFS= read -r line; do
         case "$line" in
@@ -1135,7 +1825,7 @@ tail_realtime_report() {
 }
 
 watch_inotify() {
-    echo -e "${C}[*] Real-time: використовую inotifywait (миттєва реакція)${Z}"
+    echo -e "${C}[*] Real-time: using inotifywait (instant reaction)${Z}"
     inotifywait -m -r -e create -e moved_to -e close_write \
         --format '%w%f' "$ROOT_DIR" 2>/dev/null | while IFS= read -r path; do
         feed_realtime_path "$path"
@@ -1143,7 +1833,7 @@ watch_inotify() {
 }
 
 watch_poll() {
-    echo -e "${Y}[WARN] inotifywait не знайдено -> fallback на polling кожні ${WATCH_INTERVAL}с (встанови пакет inotify-tools для миттєвої реакції)${Z}"
+    echo -e "${Y}[WARN] inotifywait not found -> falling back to polling every ${WATCH_INTERVAL}s (install inotify-tools for instant reaction)${Z}"
     local known="$WORK_DIR/rt_known.tsv" cur="$WORK_DIR/rt_current.tsv"
     find "$ROOT_DIR" -type f -not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*" 2>/dev/null \
         | sort > "$known"
@@ -1167,8 +1857,8 @@ cleanup_realtime() {
 
 run_realtime_watch() {
     echo -e "\n${B}=================================================${Z}"
-    echo -e "${B} REAL-TIME MODE${Z} — базовий скан завершено, слідкую за ${C}${ROOT_DIR}${Z}"
-    echo -e " Ctrl+C щоб зупинити"
+    echo -e "${B} REAL-TIME MODE${Z} — base scan done, watching ${C}${ROOT_DIR}${Z}"
+    echo -e " Ctrl+C to stop"
     echo -e "${B}=================================================${Z}\n"
 
     start_realtime_worker || return 1
@@ -1182,26 +1872,53 @@ run_realtime_watch() {
 }
 
 # ============================================================================
-# 16. main() — єдина точка входу; жорстко фіксує порядок ініціалізації, тож
-#     жоден модуль ніколи не викликається раніше, ніж заповнені потрібні йому
-#     глобальні змінні.
+# 16. main() — single entry point; enforces init order so no module runs
+#     before its required globals are set.
 # ============================================================================
 main() {
     detect_platform
     parse_args "$@"
     setup_colors
 
-    [ "$DO_UPDATE" = true ] && update_signatures "$SIGNATURES" "$MB_KEY"
+    if [ "$DO_SETUP" = true ]; then
+        run_self_setup
+        exit $?
+    fi
 
+    if [ "$DO_CHECK_DEPS" = true ]; then
+        check_dependencies_report
+        exit 0
+    fi
+
+    # BusyBox bootstrap must happen before everything else — the signature
+    # updater, compiler, and scanning all depend on BUSYBOX_BIN/SHA256_CMD/
+    # MD5_CMD/STRINGS_CMD/FILE_CMD set here.
+    init_toolchain
     YARA_CMD=$(detect_yara)
-    init_workers
+    detect_yarac
 
-    SHA256_CMD=$(detect_sha256)
-    MD5_CMD=$(detect_md5)
+    # --update is a standalone action (like typical AV tools separate
+    # update from scan): update signatures, then exit, no auto-scan.
+    if [ "$DO_UPDATE" = true ]; then
+        update_signatures "$SIGNATURES" "$MB_KEY"
+
+        # Compile right away (not a scan — no target files touched) so the
+        # persistent cache is fresh immediately and the printed SHA256/MD5/
+        # HexERE/Strings/YARA counts reflect exactly what the next scan
+        # will use, as a sanity check that nothing broke in the update.
+        local tmp_compile_dir
+        tmp_compile_dir=$(mktemp -d 2>/dev/null || mktemp -d -t 'av_update_compile.XXXXXX')
+        compile_signatures "$SIGNATURES" "$tmp_compile_dir"
+        rm -rf "$tmp_compile_dir"
+
+        echo -e "${C}[*] Update finished. Auto-scan after --update is disabled — run a scan as a separate command.${Z}"
+        exit 0
+    fi
+
+    init_workers
 
     init_workdir
     check_deps
-    detect_tools "$ALLOW_BUSYBOX"
     init_quarantine
 
     extract_worker
@@ -1224,9 +1941,9 @@ main() {
     print_report
     save_report
 
-    # Real-time watch стартує ПІСЛЯ базового скану (той самий trap cleanup
-    # вже активний і покриє й цю фазу — Ctrl+C/SIGTERM коректно зупинить
-    # і воркер-демон, і FIFO).
+    # Real-time watch starts AFTER the base scan (the same trap cleanup is
+    # already active and covers this phase too — Ctrl+C/SIGTERM stops both
+    # the worker daemon and the FIFO cleanly).
     if [ "$REALTIME_MODE" = true ]; then
         run_realtime_watch
     fi
@@ -1238,7 +1955,7 @@ main() {
 main "$@"
 
 # =============================================================================
-# 17. EMBEDDED WORKER (self-contained, теж модульний)
+# 17. EMBEDDED WORKER (self-contained, also modular)
 # =============================================================================
 #__WORKER_START__
 #!/bin/bash
@@ -1246,8 +1963,8 @@ set -uo pipefail
 export LC_ALL=C
 
 # ----------------------------------------------------------------------------
-# GLOBALS — усі змінні воркера визначені один раз тут, ДО функцій, що їх
-# використовують.
+# GLOBALS — all worker variables defined once here, before any function
+# uses them.
 # ----------------------------------------------------------------------------
 POOL_FILE="${1:?}"
 WORKER_ID="${2:?}"
@@ -1260,8 +1977,9 @@ MD5_CMD="${8:-none}"
 STRINGS_CMD="${9:-bash}"
 FILE_CMD="${10:-bash}"
 YARA_CMD="${11:-none}"
-QUARANTINE_DIR="${12:-}"      # порожньо = карантин вимкнено
+QUARANTINE_DIR="${12:-}"      # empty = quarantine disabled
 QUARANTINE_PERM="${13:-0400}"
+BUSYBOX_BIN="${14:-}"         # inherited from the main script (same binary)
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
@@ -1276,13 +1994,39 @@ HAS_STRINGS=false
 HAS_HEX_ERE=false
 HAS_YARA=false
 YARA_TARGET=""
+BB_APPLETS=""
 
 declare -a BATCH_SHA=()
 declare -a BATCH_MD5=()
 declare -a BATCH_YARA=()
+declare -a BATCH_HEUR=()
 SHA_BATCH_CNT=0
 MD5_BATCH_CNT=0
 YARA_BATCH_CNT=0
+HEUR_BATCH_CNT=0
+# Larger than the hash/YARA batch size on purpose: grep -E -f's automaton
+# build cost is paid once per batch regardless of size, so bigger batches
+# amortize it over more files.
+HEUR_BATCH_SIZE=200
+
+# ----------------------------------------------------------------------------
+# MODULE: busybox wrapper (own copy — the worker runs as a separate bash
+# process, so it cannot share the main script's function)
+# ----------------------------------------------------------------------------
+if [ -n "$BUSYBOX_BIN" ] && [ -x "$BUSYBOX_BIN" ]; then
+    while IFS= read -r _a; do
+        [ -n "$_a" ] && BB_APPLETS="${BB_APPLETS}${_a} "
+    done < <("$BUSYBOX_BIN" --list 2>/dev/null)
+    BB_APPLETS=" ${BB_APPLETS}"
+fi
+
+bb() {
+    local applet="$1"; shift
+    case "$BB_APPLETS" in
+        *" $applet "*) "$BUSYBOX_BIN" "$applet" "$@" ;;
+        *) command "$applet" "$@" ;;
+    esac
+}
 
 # ----------------------------------------------------------------------------
 # MODULE: init
@@ -1305,19 +2049,19 @@ init_worker_state() {
 # MODULE: low-level helpers (stat / hash / decode / strings / file-type)
 # ----------------------------------------------------------------------------
 _stat_size() {
-    if [ "$OS" = "macos" ]; then stat -f '%z' "$1" 2>/dev/null
-    else stat -c '%s' "$1" 2>/dev/null; fi
+    if [ "$OS" = "macos" ]; then bb stat -f '%z' "$1" 2>/dev/null
+    else bb stat -c '%s' "$1" 2>/dev/null; fi
 }
 _stat_mode() {
     if [ "$OS" = "macos" ]; then
-        local m; m=$(stat -f '%Op' "$1" 2>/dev/null) && printf '%s' "${m: -4}"
+        local m; m=$(bb stat -f '%Op' "$1" 2>/dev/null) && printf '%s' "${m: -4}"
     else
-        stat -c '%a' "$1" 2>/dev/null
+        bb stat -c '%a' "$1" 2>/dev/null
     fi
 }
 _sha256_stdin() {
     [ "$SHA256_CMD" = "none" ] && { cat >/dev/null; echo ""; return; }
-    $SHA256_CMD 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1
+    $SHA256_CMD 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1
 }
 _b64decode() {
     if [ "$OS" = "macos" ]; then base64 -D 2>/dev/null
@@ -1326,9 +2070,9 @@ _b64decode() {
 
 _bash_strings() {
     local file="$1" min_len="${2:-6}" max_bytes="${3:-524288}"
-    dd if="$file" bs="$max_bytes" count=1 2>/dev/null \
-    | od -An -tx1 -v | tr -s ' ' '\n' | grep -v '^\s*$' \
-    | awk -v min="$min_len" '
+    bb dd if="$file" bs="$max_bytes" count=1 2>/dev/null \
+    | bb od -An -tx1 -v | tr -s ' ' '\n' | bb grep -v '^\s*$' \
+    | bb awk -v min="$min_len" '
         function h2d(h, v,i,c) {
             v=0; h=tolower(h)
             for(i=1;i<=length(h);i++){ c=substr(h,i,1); v=v*16+(c~/[0-9]/?c+0:index("abcdef",c)+9) }
@@ -1345,7 +2089,7 @@ _bash_strings() {
 
 _bash_file_type() {
     local magic
-    magic=$(dd if="$1" bs=8 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+    magic=$(bb dd if="$1" bs=8 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n')
     [ -z "$magic" ] && { echo "EMPTY"; return; }
     case "$magic" in
         7f454c46*) echo "ELF" ;;
@@ -1368,7 +2112,7 @@ do_strings() {
     if [ "$STRINGS_CMD" = "bash" ]; then
         _bash_strings "$file" "$min" "$maxb"
     else
-        dd if="$file" bs="$maxb" count=1 2>/dev/null | $STRINGS_CMD -n "$min" 2>/dev/null
+        bb dd if="$file" bs="$maxb" count=1 2>/dev/null | $STRINGS_CMD -n "$min" 2>/dev/null
     fi
 }
 
@@ -1401,12 +2145,9 @@ do_file_type() {
 # ----------------------------------------------------------------------------
 log() { printf '[%s] %s\n' "$WORKER_ID" "$*" >> "$REPORT"; }
 
-# threat() — єдина точка входу для будь-якої знахідки: логує Й (за потреби)
-# одразу відправляє файл у карантин. Раніше виклики виглядали як
-# threat "TYPE|$file|info=..." (один рядок), що не давало явного доступу до
-# шляху файлу для подальших дій. Тепер сигнатура threat(type, file, info) —
-# формат рядка в звіті лишився ідентичним ("TYPE|file|info"), тож парсер
-# у головному скрипті (build_report/print_report) не зламався.
+# threat() — single entry point for any finding: logs it and, if enabled,
+# quarantines the file. Report line format ("TYPE|file|info") is unchanged
+# so build_report/print_report parsing still works.
 threat() {
     local type="$1" file="$2" info="${3:-}"
     printf 'THREAT:%s|%s|%s\n' "$type" "$file" "$info" >> "$REPORT"
@@ -1429,21 +2170,19 @@ quarantine_file() {
 
     mkdir -p "$QUARANTINE_DIR" 2>/dev/null
 
-    # Ім'я в карантині = sha256(оригінальний_шлях) + оригінальна назва файлу.
-    # Це унікально ідентифікує файл (навіть якщо однакові імена лежали в
-    # різних директоріях) без потреби відтворювати всю оригінальну структуру
-    # директорій всередині карантину.
+    # Quarantine filename = sha256(original path) + original basename —
+    # unique even for same-name files from different directories, without
+    # recreating the original directory tree inside quarantine.
     local path_hash qfile ts
     ts=$(date +%s)
-    path_hash=$(printf '%s' "$src" | sha256sum 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1)
+    path_hash=$(printf '%s' "$src" | bb sha256sum 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
     [ -z "$path_hash" ] && path_hash="$(date +%s%N)_$$"
     qfile="${QUARANTINE_DIR}/${path_hash}_$(basename -- "$src")"
 
     if mv -f -- "$src" "$qfile" 2>/dev/null; then
         chmod "$QUARANTINE_PERM" "$qfile" 2>/dev/null
-        # Маніфест для відновлення: оригінальний_шлях <TAB> файл_в_карантині
-        # <TAB> тип_загрози <TAB> unix-час. Відновлення — це просто
-        # `mv "$qfile" "$src"` за даними з цього рядка.
+        # Manifest for restore: original_path <TAB> quarantined_file <TAB>
+        # threat_type <TAB> unix_time. Restore = mv "$qfile" "$src".
         printf '%s\t%s\t%s\t%s\n' "$src" "$qfile" "$type" "$ts" >> "${QUARANTINE_DIR}/manifest.tsv"
         log "QUARANTINED: $src -> $qfile ($type)"
     else
@@ -1466,19 +2205,17 @@ process_hash_batch() {
     out=$($cmd "$@" 2>/dev/null)
     [ -z "$out" ] && return
 
-    # ФІКС: "grep -F -f - sig_file" повертає ПОВНІ рядки бази (hash<TAB>name),
-    # а не самі хеші. Без завершального "cut -f1" наступний grep "^$hit_hash"
-    # порівнював рядок з рядком і ніколи нічого не знаходив — виявлення
-    # відомого малваре за хешем не працювало. Тепер hits містить чисті хеші.
+    # "grep -F -f - sig_file" returns full "hash<TAB>name" lines, not just
+    # the hash — the trailing "cut -f1" extracts the clean hash.
     local hits
-    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | grep -F -f - "$sig_file" 2>/dev/null | cut -f1)
+    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | bb grep -F -f - "$sig_file" 2>/dev/null | cut -f1)
     if [ -n "$hits" ]; then
         while IFS= read -r hit_hash; do
             [ -z "$hit_hash" ] && continue
             local tname
-            tname=$(grep -F -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -d$'\t' -f2)
+            tname=$(bb grep -F -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -d$'\t' -f2)
             local hit_file
-            hit_file=$(printf '%s\n' "$out" | grep -iE "^${hit_hash}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
+            hit_file=$(printf '%s\n' "$out" | bb grep -iE "^${hit_hash}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
             [ -n "$hit_file" ] && threat "KNOWN_MALWARE" "$hit_file" "name=${tname:-Malware}|$htype=$hit_hash"
         done <<< "$hits"
     fi
@@ -1489,69 +2226,127 @@ process_hash_batch() {
 # ----------------------------------------------------------------------------
 process_yara_batch() {
     [ $# -eq 0 ] || [ "$HAS_YARA" = false ] || [ "$YARA_CMD" = "none" ] && return
-    local yara_out
-    yara_out=$($YARA_CMD "$YARA_TARGET" "$@" 2>/dev/null)
+
+    # FIX: the yara CLI only takes ONE scan target (a file, or a directory
+    # with -r) — NOT a list of arbitrary file paths as trailing arguments.
+    # Passing several files the old way ("yara rules f1 f2 f3") errors out
+    # ("can't accept multiple rules files...") and silently produced zero
+    # matches every time (stderr discarded) — YARA detection never actually
+    # worked for batches of more than one file. Fix: symlink the batch into
+    # a throwaway directory and scan that with -r, same pattern already
+    # used for the strings/hex heuristic batch.
+    local tmpdir
+    tmpdir=$(mktemp -d 2>/dev/null) || return
+    local -a idx_to_file=()
+    local i=0 f
+    for f in "$@"; do
+        idx_to_file[$i]="$f"
+        ln -sf "$f" "$tmpdir/$i" 2>/dev/null
+        i=$((i + 1))
+    done
+
+    local yara_out yara_flags=(-d filename= -d filepath= -d extension=)
+    # A compiled ruleset (.yarc) MUST be loaded with -C, or yara tries to
+    # parse the binary as rule *source* and fails outright.
+    case "$YARA_TARGET" in
+        *.yarc) yara_flags+=(-C) ;;
+    esac
+    yara_out=$($YARA_CMD "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
     if [ -n "$yara_out" ]; then
         while IFS= read -r yline; do
             [ -z "$yline" ] && continue
             local yrule; yrule=$(echo "$yline" | awk '{print $1}')
-            local yfile; yfile=$(echo "$yline" | cut -d' ' -f2-)
+            local ylink; ylink=$(echo "$yline" | cut -d' ' -f2-)
+            local yi="${ylink##*/}"
+            local yfile="${idx_to_file[$yi]:-$ylink}"
             threat "YARA_MATCH" "$yfile" "rule=$yrule"
         done <<< "$yara_out"
     fi
+    rm -rf "$tmpdir"
 }
 
 # ----------------------------------------------------------------------------
-# MODULE: heuristics
+# MODULE: heuristics (batched strings/hex matching)
+#
+# grep -E -f builds its match automaton FROM SCRATCH on every invocation.
+# With a realistic ClamAV .ndb+.ldb signature set that's tens/hundreds of
+# thousands of patterns, that build alone can take seconds — calling it
+# once PER FILE (as before) made a scan of 20k+ files effectively hang.
+# Same fix pattern as hashes/YARA: batch many files into one grep call so
+# the automaton is built once per batch, not once per file.
 # ----------------------------------------------------------------------------
+process_heuristic_batch() {
+    [ $# -eq 0 ] && return
+    { [ "$HAS_STRINGS" = true ] || [ "$HAS_HEX_ERE" = true ]; } || return
+
+    local tmpdir
+    tmpdir=$(mktemp -d 2>/dev/null) || return
+
+    local -a idx_to_file=()
+    local -a flagged=()
+    local i=0 f
+    for f in "$@"; do
+        idx_to_file[$i]="$f"
+        flagged[$i]=0
+        [ "$HAS_STRINGS" = true ] && do_strings "$f" 6 524288 > "$tmpdir/${i}.str" 2>/dev/null
+        [ "$HAS_HEX_ERE" = true ] && bb dd if="$f" bs=524288 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n' > "$tmpdir/${i}.hex" 2>/dev/null
+        i=$((i + 1))
+    done
+
+    if [ "$HAS_STRINGS" = true ]; then
+        local mf mi orig pat
+        while IFS= read -r mf; do
+            [ -z "$mf" ] && continue
+            mi="${mf##*/}"; mi="${mi%.str}"
+            orig="${idx_to_file[$mi]:-}"
+            [ -z "$orig" ] && continue
+            flagged[$mi]=1
+            pat=$(bb grep -F -i -o -f "$SIG_DIR/strings.txt" "$mf" 2>/dev/null | head -1)
+            threat "SIG_STRING_MATCH" "$orig" "pattern=${pat:0:50}"
+        done < <(bb grep -F -i -l -f "$SIG_DIR/strings.txt" "$tmpdir"/*.str 2>/dev/null)
+    fi
+
+    if [ "$HAS_HEX_ERE" = true ]; then
+        local mf mi orig hx
+        while IFS= read -r mf; do
+            [ -z "$mf" ] && continue
+            mi="${mf##*/}"; mi="${mi%.hex}"
+            [ "${flagged[$mi]:-0}" = "1" ] && continue
+            orig="${idx_to_file[$mi]:-}"
+            [ -z "$orig" ] && continue
+            hx=$(bb grep -E -o -i -f "$SIG_DIR/hex_ere.txt" "$mf" 2>/dev/null | head -1)
+            [ -n "$hx" ] && threat "HEX_SIG_MATCH" "$orig" "hex=${hx:0:40}..."
+        done < <(bb grep -E -l -i -f "$SIG_DIR/hex_ere.txt" "$tmpdir"/*.hex 2>/dev/null)
+    fi
+
+    rm -rf "$tmpdir"
+}
+
 check_file_heuristics() {
     local file="$1" size="$2" oct="$3"
 
     if [ "$size" -lt "$MAX_SIZE" ]; then
-        # Strings
-        if [ "$HAS_STRINGS" = true ]; then
-            local str_match
-            str_match=$(do_strings "$file" 6 524288 | grep -F -i -f "$SIG_DIR/strings.txt" 2>/dev/null | head -1)
-            if [ -n "$str_match" ]; then
-                threat "SIG_STRING_MATCH" "$file" "pattern=${str_match:0:50}"
-                return
-            fi
-        fi
-
-        # Hex ERE
-        if [ "$HAS_HEX_ERE" = true ]; then
-            local hex_dump hex_match
-            hex_dump=$(dd if="$file" bs=524288 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
-            if [ -n "$hex_dump" ]; then
-                hex_match=$(printf '%s\n' "$hex_dump" | grep -E -o -i -f "$SIG_DIR/hex_ere.txt" 2>/dev/null | head -1)
-                if [ -n "$hex_match" ]; then
-                    threat "HEX_SIG_MATCH" "$file" "hex=${hex_match:0:40}..."
-                    return
-                fi
-            fi
-        fi
-
         # Base64 payloads
         while IFS= read -r chunk; do
             [ -z "$chunk" ] && continue
             if [ "$HAS_B64" = true ] && [ "$SHA256_CMD" != "none" ]; then
                 local dh
                 dh=$(printf '%s' "$chunk" | _b64decode | _sha256_stdin)
-                if [ -n "$dh" ] && grep -qF "$dh" "$SIG_DIR/b64_payloads.tsv" 2>/dev/null; then
+                if [ -n "$dh" ] && bb grep -qF "$dh" "$SIG_DIR/b64_payloads.tsv" 2>/dev/null; then
                     local bname
-                    bname=$(grep -F -m 1 "^$dh" "$SIG_DIR/b64_payloads.tsv" | cut -d$'\t' -f2)
+                    bname=$(bb grep -F -m 1 "^$dh" "$SIG_DIR/b64_payloads.tsv" | cut -d$'\t' -f2)
                     threat "KNOWN_B64_PAYLOAD" "$file" "name=${bname:-B64.Malware}|b64=${chunk:0:20}..."
                     continue
                 fi
             fi
             local magic
-            magic=$(printf '%s' "$chunk" | _b64decode 2>/dev/null | dd bs=8 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+            magic=$(printf '%s' "$chunk" | _b64decode 2>/dev/null | bb dd bs=8 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n')
             case "$magic" in
                 7f454c46*) threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=ELF|b64=${chunk:0:20}..." ;;
                 4d5a*)     threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=PE_MZ|b64=${chunk:0:20}..." ;;
                 2321*)     threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=SCRIPT|b64=${chunk:0:20}..." ;;
             esac
-        done < <(grep -oE '[A-Za-z0-9+/]{40,}={0,2}' "$file" 2>/dev/null | head -20)
+        done < <(bb grep -oE '[A-Za-z0-9+/]{40,}={0,2}' "$file" 2>/dev/null | head -20)
     fi
 
     # Disguised
@@ -1568,13 +2363,9 @@ check_file_heuristics() {
     esac
 
     # Permissions
-    # ФІКС: stat/find зазвичай повертають 3-значний октальний режим ("644"),
-    # без setuid/setgid-біта. "${oct: -4}" на рядку коротшому за 4 символи
-    # в bash повертає ПОРОЖНІЙ рядок (від'ємний офсет виходить за межі), тому
-    # 8#$oct ставав "8#" -> "invalid integer constant", і перевірка
-    # SUID/SGID/world-writable мовчки ламалась на кожному файлі. Тепер
-    # спочатку доповнюємо нулями зліва до 4 символів, і лише потім беремо
-    # останні 4.
+    # stat/find usually return a 3-digit octal mode ("644") with no
+    # setuid/setgid bit. "${oct: -4}" on a string shorter than 4 chars
+    # returns EMPTY in bash, so pad with zeros first.
     if [ -n "$oct" ] && [ "$oct" != "0" ]; then
         oct="0000${oct}"
         oct="${oct: -4}"
@@ -1584,12 +2375,7 @@ check_file_heuristics() {
 }
 
 # ----------------------------------------------------------------------------
-# MODULE: scan loop
-# ФІКС: увесь цикл тепер живе всередині функції run_scan_loop(), а не на
-# верхньому рівні файлу. Раніше "local file size oct" стояло поза функцією,
-# що в bash — помилка ("local: can only be used in a function") на кожній
-# ітерації. Тепер local-змінні коректні й справді ізольовані від глобального
-# простору імен.
+# MODULE: scan loop (lives inside a function so "local" is valid)
 # ----------------------------------------------------------------------------
 run_scan_loop() {
     local col1 col2 col3 file size oct magic_type skip_deep ext
@@ -1654,18 +2440,29 @@ run_scan_loop() {
                     BATCH_YARA=(); YARA_BATCH_CNT=0
                 fi
             fi
+
+            # Batched strings/hex heuristic matching (see process_heuristic_batch)
+            if [ "$HAS_STRINGS" = true ] || [ "$HAS_HEX_ERE" = true ]; then
+                BATCH_HEUR+=("$file")
+                HEUR_BATCH_CNT=$(( HEUR_BATCH_CNT + 1 ))
+                if [ "$HEUR_BATCH_CNT" -ge "$HEUR_BATCH_SIZE" ]; then
+                    process_heuristic_batch "${BATCH_HEUR[@]}"
+                    BATCH_HEUR=(); HEUR_BATCH_CNT=0
+                fi
+            fi
         fi
 
-        # Full heuristics
+        # Cheap per-file checks (base64 payloads, disguised ext, perms)
         check_file_heuristics "$file" "$size" "${oct:-0}"
 
         [ $(( FILES_SCANNED % 50 )) -eq 0 ] && progress "$file"
     done < "$POOL_FILE"
 
-    # Flush залишків батчів
+    # Flush remaining batches
     [ "$SHA_BATCH_CNT" -gt 0 ] && process_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
     [ "$MD5_BATCH_CNT" -gt 0 ] && process_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
     [ "$YARA_BATCH_CNT" -gt 0 ] && process_yara_batch "${BATCH_YARA[@]}"
+    [ "$HEUR_BATCH_CNT" -gt 0 ] && process_heuristic_batch "${BATCH_HEUR[@]}"
 }
 
 # ----------------------------------------------------------------------------
@@ -1679,7 +2476,7 @@ finalize_worker() {
 }
 
 # ----------------------------------------------------------------------------
-# main() воркера
+# worker main()
 # ----------------------------------------------------------------------------
 main() {
     log "Worker started PID=$$ OS=$OS yara=$YARA_CMD"
