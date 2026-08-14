@@ -28,7 +28,12 @@
 #   -d, --dir PATH          Target directory to scan (default: /mnt)
 #   -s, --sigs PATH         Signature directory (default: ./signatures)
 #   -m, --max-size MB       Max file size for deep inspection in MB (default: 10)
-#   -o, --output FILE       Save final report to file
+#   -o, --output FILE       Report file. Written to LIVE as threats are
+#                            found (not just at the end) — if the scan gets
+#                            interrupted, whatever's in this file up to
+#                            that point is still valid. Without -o, a
+#                            default ./av_scan_threats_<timestamp>.log is
+#                            used automatically (never silently discarded).
 #   --no-ram                Force /tmp instead of /dev/shm
 #   --no-busybox            Fully disable busybox (no auto-download, no local
 #                            binary use) — system tools only
@@ -47,11 +52,32 @@
 #                            automaton from a full real ClamAV .ndb+.ldb set
 #                            (100k+ patterns); raising this trades scan
 #                            speed for hex-signature coverage
-#   --setup                  Build yara/yarac from source into bin/ (and
-#                            fetch busybox if missing), then exit. Needs a
-#                            C toolchain (auto-installed via apt/yum/apk if
-#                            possible) and network access.
-#   --setup --force           Same, but rebuild even if bin/yara already exists
+#   --batch-size N            Files per hash/YARA batch (default: 50).
+#                            Smaller = smoother progress (threats show up
+#                            more incrementally instead of jumping when a
+#                            big batch finishes), at some throughput cost.
+#   --heur-batch-size N       Files per strings/hex heuristic batch (default: 50)
+#   --pe-batch-size N         Files per PE-section/.mdb batch (default: 50)
+#   --setup                  Install yara/yarac into bin/ (and fetch busybox
+#                            if missing), then exit. Prefers --yara-url if
+#                            given; otherwise compiles from source (needs a
+#                            C toolchain — auto-installed via whichever of
+#                            apt/dnf/yum/zypper/pacman/apk is present).
+#   --yara-url URL            Install yara/yarac from a prebuilt tarball at
+#                            this URL instead of compiling — no compiler
+#                            needed on the target machine. YARA publishes no
+#                            official prebuilt binaries, so this is meant to
+#                            point at your OWN mirror: build once with
+#                            --setup --compile on one machine, host the
+#                            resulting bin/{yara,yarac} as a .tar.gz
+#                            somewhere reachable, then every other machine
+#                            just downloads it (same idea as busybox, just
+#                            self-hosted since no upstream exists for yara)
+#   --busybox-url URL         Override the busybox download URL (internal
+#                            mirror), same idea as --yara-url
+#   --setup --compile         Force compiling from source even if
+#                            --yara-url is also given
+#   --setup --force           Reinstall/rebuild even if bin/yara already exists
 #   --check-deps             Print bundled/system/missing status for
 #                            busybox and yara/yarac, then exit
 #   -h, --help               Show this help (also runs --check-deps)
@@ -130,15 +156,28 @@ ROOT_DIR="/mnt"
 MAX_SCAN_MB=10
 MAX_RAM_MB=500
 OUTPUT_FILE=""
+LIVE_REPORT_FILE=""    # persistent (outside WORK_DIR) file threats are
+                        # appended to AS THEY'RE FOUND, so Ctrl+C/SIGTERM
+                        # mid-scan doesn't lose already-detected results
 DO_UPDATE=false
 USE_RAM=true
 ALLOW_BUSYBOX=true
 MB_KEY=""
 WORKERS=""            # empty = "auto", resolved in init_workers()
 MAX_HEX_PATTERNS=8000 # cap on compiled hex_ere.txt entries, see compile_signatures
+BATCH_SIZE=50          # files per hash/YARA batch — smaller = smoother
+                        # progress updates (threats appear more incrementally
+                        # instead of jumping when a big batch finishes), at
+                        # some cost to throughput from more subprocess calls
+HEUR_BATCH_SIZE=50     # files per strings/hex heuristic batch
+PE_BATCH_SIZE=50       # files per PE-section (.mdb) batch
 DO_SETUP=false         # --setup: build yara/yarac (and fetch busybox) then exit
 SETUP_FORCE=false       # --setup --force: rebuild even if already present
+SETUP_COMPILE_ONLY=false # --setup --compile: skip --yara-url, always compile
 DO_CHECK_DEPS=false     # --check-deps: print dependency status and exit
+YARA_URL_ARG=""         # --yara-url: fetch a prebuilt yara/yarac tarball
+                        # instead of compiling from source (own mirror/CDN)
+BUSYBOX_URL_ARG=""      # --busybox-url: override the busybox download URL
 
 # --- Quarantine ---
 QUARANTINE_ENABLED=false
@@ -251,21 +290,32 @@ net_fetch() {
 }
 
 check_network() {
+    # Probes the actual URL that will be fetched (defaults to busybox.net)
+    # rather than a fixed unrelated host — otherwise a working --busybox-url
+    # mirror would still be reported as "no network" if busybox.net itself
+    # happens to be unreachable from this machine.
+    local target="${1:-https://busybox.net}"
     # On the first call, BUSYBOX_BIN is still empty, so this naturally
     # falls back to system wget/curl (same bootstrap exception as net_fetch).
     if [ -n "$BUSYBOX_BIN" ] && "$BUSYBOX_BIN" wget --help &>/dev/null 2>&1; then
-        "$BUSYBOX_BIN" wget -q -T 3 -O /dev/null "https://busybox.net" 2>/dev/null && return 0
+        "$BUSYBOX_BIN" wget -q -T 3 -O /dev/null "$target" 2>/dev/null && return 0
     fi
     if command -v wget &>/dev/null; then
-        wget -q --timeout=3 --spider "https://busybox.net" 2>/dev/null && return 0
+        wget -q --timeout=3 --spider "$target" 2>/dev/null && return 0
     fi
     if command -v curl &>/dev/null; then
-        curl -sf --connect-timeout 3 "https://busybox.net" >/dev/null 2>&1 && return 0
+        curl -sf --connect-timeout 3 "$target" >/dev/null 2>&1 && return 0
     fi
     return 1
 }
 
 busybox_url() {
+    # Overridable via -b-url/BUSYBOX_URL_ARG for internal mirrors — useful
+    # when target machines can't reach busybox.net directly.
+    if [ -n "$BUSYBOX_URL_ARG" ]; then
+        echo "$BUSYBOX_URL_ARG"
+        return
+    fi
     case "${OS}_${ARCH}" in
         linux_x86_64) echo "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox" ;;
         linux_arm64)  echo "https://busybox.net/downloads/binaries/1.35.0-aarch64-linux-musl/busybox" ;;
@@ -330,9 +380,11 @@ ensure_busybox() {
         return 1
     fi
 
-    if check_network; then
+    local dl_url
+    dl_url=$(busybox_url)
+    if check_network "$dl_url"; then
         echo -e "${Y}[*] Trying emergency auto-download as a fallback...${Z}"
-        download_busybox "$(busybox_url)" && return 0
+        download_busybox "$dl_url" && return 0
         echo -e "${R}[WARN] Emergency download also failed -> system tools (shell fallback)${Z}"
         return 1
     else
@@ -487,45 +539,127 @@ check_dependencies_report() {
 # ============================================================================
 # MODULE: self-setup (--setup)
 #
-# Builds yara/yarac from source and installs them at $SCRIPT_DIR/bin/,
-# alongside busybox. Unlike busybox, YARA does not publish ready static
-# binaries, so this compiles one itself — fully self-contained, no
-# external script needed (downloads source, installs a C toolchain via
-# apt/yum/apk if missing, configures, builds, strips, installs). Needs
-# root/sudo for the toolchain install and network access for the source.
+# Two ways to get yara/yarac into $SCRIPT_DIR/bin/, tried in this order:
+#
+#   1. --yara-url URL — fetch a PREBUILT tarball (containing "yara" and
+#      "yarac" binaries) from a URL you control. Unlike busybox, YARA
+#      publishes no official prebuilt binaries, so there's no universal
+#      default URL to hardcode here — but if you build once (this same
+#      --setup does that) and host the resulting bin/{yara,yarac} tarball
+#      on your own mirror/CDN/internal server, every other machine can
+#      then install it with a plain download and NO compiler at all,
+#      which is both faster and works identically across distros. This is
+#      the "do it like busybox" path, just pointed at infrastructure you
+#      host yourself instead of a project-run one that doesn't exist.
+#
+#   2. Compile from source (fallback, or always with --setup --compile).
+#      Needs a C toolchain; installed automatically via whichever of
+#      apt/dnf/yum/zypper/pacman/apk is present. Different distros name
+#      packages differently, so each branch below lists its own package
+#      names for the same underlying tools (gcc/make, autotools,
+#      pkg-config, OpenSSL dev headers).
 # ============================================================================
-run_self_setup() {
-    local version="${SETUP_YARA_VERSION:-4.5.8}"
-    echo -e "${B}=== av_scan.sh self-setup ===${Z}"
-    echo "Target: $SCRIPT_DIR/bin/{yara,yarac}"
-    echo ""
+_install_build_toolchain() {
+    local as_root="$1"
+    if command -v apt-get &>/dev/null; then
+        echo "[*] Installing build dependencies via apt..."
+        $as_root apt-get update -qq
+        $as_root apt-get install -y -qq build-essential autoconf automake libtool pkg-config libssl-dev curl
+    elif command -v dnf &>/dev/null; then
+        echo "[*] Installing build dependencies via dnf..."
+        $as_root dnf install -y gcc make autoconf automake libtool pkgconfig openssl-devel curl
+    elif command -v yum &>/dev/null; then
+        echo "[*] Installing build dependencies via yum..."
+        $as_root yum install -y gcc make autoconf automake libtool pkgconfig openssl-devel curl
+    elif command -v zypper &>/dev/null; then
+        echo "[*] Installing build dependencies via zypper..."
+        $as_root zypper --non-interactive install gcc make autoconf automake libtool pkg-config libopenssl-devel curl
+    elif command -v pacman &>/dev/null; then
+        echo "[*] Installing build dependencies via pacman..."
+        $as_root pacman -Sy --noconfirm base-devel autoconf automake libtool pkgconf openssl curl
+    elif command -v apk &>/dev/null; then
+        echo "[*] Installing build dependencies via apk..."
+        $as_root apk add build-base autoconf automake libtool pkgconfig openssl-dev curl
+    else
+        echo -e "${R}[FAIL] No supported package manager found (apt/dnf/yum/zypper/pacman/apk)${Z}"
+        echo -e "${R}       Install a C toolchain, autoconf, automake, libtool, pkg-config,${Z}"
+        echo -e "${R}       and OpenSSL dev headers manually, then re-run --setup --compile,${Z}"
+        echo -e "${R}       or use --yara-url to install a prebuilt binary instead.${Z}"
+        return 1
+    fi
+}
 
-    if [ -x "$SCRIPT_DIR/bin/yara" ] && [ -x "$SCRIPT_DIR/bin/yarac" ] && [ "${SETUP_FORCE:-false}" != true ]; then
-        echo -e "${G}[OK] bin/yara and bin/yarac already present -> nothing to do (use --setup --force to rebuild)${Z}"
-        return 0
+# Installs yara/yarac from a prebuilt tarball URL — no compiler needed.
+# Expects a .tar.gz (or .zip, if unzip is available) containing "yara" and
+# "yarac" binaries somewhere inside (top level or in a subdirectory).
+install_yara_from_url() {
+    local url="$1"
+    echo "[*] Downloading prebuilt yara/yarac from: $url"
+
+    local workdir
+    workdir=$(mktemp -d 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; return 1; }
+    local dest="$workdir/download"
+
+    if ! net_fetch "$url" "$dest" 60; then
+        echo -e "${R}[FAIL] Download failed (bad URL, or unreachable from this machine)${Z}"
+        rm -rf "$workdir"
+        return 1
     fi
 
+    local extract_dir="$workdir/extract"
+    mkdir -p "$extract_dir"
+    if tar -xzf "$dest" -C "$extract_dir" 2>/dev/null || tar -xf "$dest" -C "$extract_dir" 2>/dev/null; then
+        :
+    elif command -v unzip &>/dev/null && unzip -q "$dest" -d "$extract_dir" 2>/dev/null; then
+        :
+    else
+        # Not an archive we can unpack — maybe it's a bare "yara" binary.
+        # We still need yarac too, so this only helps if the URL is itself
+        # a directory listing situation, which we can't handle generically.
+        cp "$dest" "$extract_dir/yara" 2>/dev/null
+    fi
+
+    local found_yara found_yarac
+    found_yara=$(find "$extract_dir" -type f -name "yara" 2>/dev/null | head -1)
+    found_yarac=$(find "$extract_dir" -type f -name "yarac" 2>/dev/null | head -1)
+
+    if [ -z "$found_yara" ] || [ -z "$found_yarac" ]; then
+        echo -e "${R}[FAIL] Downloaded archive doesn't contain both a 'yara' and a 'yarac' binary${Z}"
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    mkdir -p "$SCRIPT_DIR/bin"
+    cp "$found_yara" "$SCRIPT_DIR/bin/yara"
+    cp "$found_yarac" "$SCRIPT_DIR/bin/yarac"
+    chmod +x "$SCRIPT_DIR/bin/yara" "$SCRIPT_DIR/bin/yarac"
+    rm -rf "$workdir"
+
+    if ! "$SCRIPT_DIR/bin/yara" --version &>/dev/null; then
+        echo -e "${R}[FAIL] Downloaded 'yara' binary doesn't run on this machine (wrong arch/libc?)${Z}"
+        rm -f "$SCRIPT_DIR/bin/yara" "$SCRIPT_DIR/bin/yarac"
+        return 1
+    fi
+
+    echo -e "${G}[OK] Installed prebuilt yara/yarac from URL — no compiler needed${Z}"
+    "$SCRIPT_DIR/bin/yara" --version
+    return 0
+}
+
+# Builds yara/yarac from source. Needs a C toolchain (installed
+# automatically if a supported package manager is found) and network
+# access to fetch the YARA source tarball from GitHub.
+build_yara_from_source() {
+    local version="${SETUP_YARA_VERSION:-4.5.8}"
+
     if [ "$(id -u 2>/dev/null)" != "0" ] && ! command -v sudo &>/dev/null; then
-        echo -e "${R}[FAIL] Need root or sudo to install build dependencies (build-essential, autoconf, automake, libtool, pkg-config, libssl-dev)${Z}"
+        echo -e "${R}[FAIL] Need root or sudo to install build dependencies${Z}"
         return 1
     fi
     local as_root=""
     [ "$(id -u 2>/dev/null)" != "0" ] && as_root="sudo"
 
-    if command -v apt-get &>/dev/null; then
-        echo "[*] Installing build dependencies via apt..."
-        $as_root apt-get update -qq
-        $as_root apt-get install -y -qq build-essential autoconf automake libtool pkg-config libssl-dev curl
-    elif command -v yum &>/dev/null; then
-        echo "[*] Installing build dependencies via yum..."
-        $as_root yum install -y gcc make autoconf automake libtool pkgconfig openssl-devel curl
-    elif command -v apk &>/dev/null; then
-        echo "[*] Installing build dependencies via apk..."
-        $as_root apk add build-base autoconf automake libtool pkgconfig openssl-dev curl
-    else
-        echo -e "${R}[FAIL] No supported package manager found (apt/yum/apk) — install a C toolchain, autoconf, automake, libtool, pkg-config, and libssl-dev manually, then re-run --setup${Z}"
-        return 1
-    fi
+    _install_build_toolchain "$as_root" || return 1
 
     local workdir
     workdir=$(mktemp -d 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; return 1; }
@@ -562,6 +696,24 @@ run_self_setup() {
     echo -e "${G}[OK] Built: $SCRIPT_DIR/bin/yara, $SCRIPT_DIR/bin/yarac${Z}"
     "$SCRIPT_DIR/bin/yara" --version
     echo "     Dependencies: $(ldd "$SCRIPT_DIR/bin/yara" 2>/dev/null | awk '{print $1}' | grep -v '^$' | tr '\n' ' ')"
+    return 0
+}
+
+run_self_setup() {
+    echo -e "${B}=== av_scan.sh self-setup ===${Z}"
+    echo "Target: $SCRIPT_DIR/bin/{yara,yarac}"
+    echo ""
+
+    if [ -x "$SCRIPT_DIR/bin/yara" ] && [ -x "$SCRIPT_DIR/bin/yarac" ] && [ "${SETUP_FORCE:-false}" != true ]; then
+        echo -e "${G}[OK] bin/yara and bin/yarac already present -> nothing to do (use --setup --force to rebuild)${Z}"
+    elif [ -n "$YARA_URL_ARG" ] && [ "${SETUP_COMPILE_ONLY:-false}" != true ]; then
+        install_yara_from_url "$YARA_URL_ARG" || {
+            echo -e "${Y}[WARN] Prebuilt install failed -> falling back to compiling from source${Z}"
+            build_yara_from_source
+        }
+    else
+        build_yara_from_source
+    fi
 
     # busybox too, while we're setting things up, if it isn't there yet.
     if [ ! -x "$SCRIPT_DIR/bin/busybox" ]; then
@@ -590,6 +742,8 @@ parse_args() {
             --no-ram)        USE_RAM=false; shift ;;
             --no-busybox)    ALLOW_BUSYBOX=false; shift ;;
             -b|--busybox)    BUSYBOX_PATH_ARG="$2"; shift 2 ;;
+            --busybox-url)   BUSYBOX_URL_ARG="$2"; shift 2 ;;
+            --yara-url)      YARA_URL_ARG="$2"; shift 2 ;;
             --mb-key)        MB_KEY="$2"; shift 2 ;;
             -q|--quarantine) QUARANTINE_ENABLED=true; shift ;;
             --quarantine-dir)  QUARANTINE_ENABLED=true; QUARANTINE_DIR="$2"; shift 2 ;;
@@ -597,8 +751,12 @@ parse_args() {
             -w|--real-time|--realtime) REALTIME_MODE=true; shift ;;
             --watch-interval)  WATCH_INTERVAL="$2"; shift 2 ;;
             --max-hex-patterns) MAX_HEX_PATTERNS="$2"; shift 2 ;;
+            --batch-size)    BATCH_SIZE="$2"; shift 2 ;;
+            --heur-batch-size) HEUR_BATCH_SIZE="$2"; shift 2 ;;
+            --pe-batch-size) PE_BATCH_SIZE="$2"; shift 2 ;;
             --setup)         DO_SETUP=true; shift ;;
             --force)         SETUP_FORCE=true; shift ;;
+            --compile)       SETUP_COMPILE_ONLY=true; shift ;;
             --check-deps)    DO_CHECK_DEPS=true; shift ;;
             -h|--help)       usage ;;
             *) echo "Unknown parameter: $1"; exit 1 ;;
@@ -674,6 +832,34 @@ init_quarantine() {
 
 count_quarantined() {
     bb grep -h "QUARANTINED:" "$WORK_DIR/reports"/*.txt 2>/dev/null | bb wc -l | tr -d ' '
+}
+
+# Sets up a persistent live threat log OUTSIDE WORK_DIR (which cleanup()
+# deletes on interrupt) — workers append to it AS threats are found, so an
+# interrupted scan still leaves usable results behind instead of losing
+# everything found up to that point.
+init_live_report() {
+    if [ -n "$OUTPUT_FILE" ]; then
+        LIVE_REPORT_FILE="$OUTPUT_FILE"
+    else
+        LIVE_REPORT_FILE="$(pwd)/av_scan_threats_$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "$$").log"
+    fi
+
+    if ! { : > "$LIVE_REPORT_FILE"; } 2>/dev/null; then
+        echo -e "${Y}[WARN] Can't write to ${LIVE_REPORT_FILE} -> live threat log disabled (results only available at the end)${Z}"
+        LIVE_REPORT_FILE=""
+        return 0
+    fi
+
+    {
+        echo "# Oprhus AV Scanner — live threat log (updated as threats are found)"
+        echo "# Target: $ROOT_DIR"
+        echo "# Started: $(date 2>/dev/null || echo unknown)"
+        echo "# If this scan gets interrupted, whatever is below this line is still valid."
+        echo "#"
+    } >> "$LIVE_REPORT_FILE" 2>/dev/null
+
+    echo -e "${C}[*] Live threat log: ${LIVE_REPORT_FILE}${Z}"
 }
 
 # ============================================================================
@@ -1651,7 +1837,8 @@ launch_workers() {
             "$pool" "$wid" "$WORK_DIR/reports" \
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
             "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
-            "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" &
+            "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
+            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" &
         WORKER_PIDS+=($!)
     done
 }
@@ -1706,7 +1893,17 @@ show_progress() {
 
         local mem_mb=0
         if [ "${#active_pids[@]}" -gt 0 ]; then
-            mem_mb=$(ps -o rss= -p "${active_pids[@]}" 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
+            # Workers spend most of their active time inside short-lived
+            # CHILD processes (grep against a 600k+ line md5.tsv, yara,
+            # dd/od) rather than holding memory in the worker bash process
+            # itself — summing only the parent PIDs' own RSS massively
+            # undercounts real usage (reads as ~0MB even under real load).
+            # Include direct children too.
+            local ppid_list child_pids all_pids
+            ppid_list=$(IFS=,; echo "${active_pids[*]}")
+            child_pids=$(ps --ppid "$ppid_list" -o pid= 2>/dev/null | tr -d ' ')
+            all_pids="${active_pids[*]} $child_pids"
+            mem_mb=$(ps -o rss= -p $all_pids 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
         fi
         local ram_pct=0
         [ "$MAX_RAM_MB" -gt 0 ] && ram_pct=$(( mem_mb * 100 / MAX_RAM_MB ))
@@ -1742,8 +1939,21 @@ cleanup() {
     for p in "${WORKER_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
     cleanup_realtime
     tput cnorm 2>/dev/null || true
+
+    local found=0
+    if [ -n "$LIVE_REPORT_FILE" ] && [ -f "$LIVE_REPORT_FILE" ]; then
+        # NOTE: grep -c legitimately PRINTS "0" on zero matches while also
+        # exiting 1 (that's not an error, just "no match") — a "|| echo 0"
+        # fallback here would double up and print "0\n0" into $found.
+        found=$(bb grep -c "^\[" "$LIVE_REPORT_FILE" 2>/dev/null)
+        found="${found:-0}"
+    fi
+
     rm -rf "$WORK_DIR"
     echo -e "\n${Y}[WARN] Scan aborted${Z}"
+    if [ -n "$LIVE_REPORT_FILE" ]; then
+        echo -e "${C}[*] ${found} threat(s) found before interruption -> saved to: ${LIVE_REPORT_FILE}${Z}"
+    fi
     exit 130
 }
 
@@ -1799,15 +2009,15 @@ print_report() {
 }
 
 save_report() {
-    [ -n "$OUTPUT_FILE" ] || return 0
+    [ -n "$LIVE_REPORT_FILE" ] || return 0
     {
         echo "$RPT"
         [ "$TT" -gt 0 ] && {
             echo -e "\n=== DETECTED THREATS ==="
             bb grep "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d: -f2- | bb sort -u
         }
-    } > "$OUTPUT_FILE"
-    echo -e "\n[*] Report saved: ${C}${OUTPUT_FILE}${Z}"
+    } > "$LIVE_REPORT_FILE"
+    echo -e "\n[*] Report saved: ${C}${LIVE_REPORT_FILE}${Z}"
 }
 
 # ============================================================================
@@ -1843,7 +2053,8 @@ start_realtime_worker() {
         "$REALTIME_FIFO" "rt" "$WORK_DIR/reports" \
         "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
         "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
-        "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" &
+        "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
+        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" &
     REALTIME_WORKER_PID=$!
 
     # Keep the write fd (3) open permanently — opening/closing per event
@@ -1969,6 +2180,8 @@ main() {
     extract_worker
     compile_signatures "$SIGNATURES" "$SIG_DIR"
 
+    init_live_report
+
     START_MS=$(now_ms)
     print_banner
 
@@ -2025,6 +2238,12 @@ YARA_CMD="${11:-none}"
 QUARANTINE_DIR="${12:-}"      # empty = quarantine disabled
 QUARANTINE_PERM="${13:-0400}"
 BUSYBOX_BIN="${14:-}"         # inherited from the main script (same binary)
+BATCH_SIZE="${15:-50}"        # files per hash/YARA batch
+HEUR_BATCH_SIZE="${16:-50}"   # files per strings/hex heuristic batch
+PE_BATCH_SIZE="${17:-50}"     # files per PE-section (.mdb) batch
+LIVE_REPORT_FILE="${18:-}"    # persistent live threat log (outside the
+                               # ephemeral WORK_DIR) — written to immediately
+                               # as each threat is found, see threat() below
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
@@ -2039,6 +2258,7 @@ HAS_STRINGS=false
 HAS_HEX_ERE=false
 HAS_YARA=false
 HAS_MDB=false
+YARA_HAS_SCAN_LIST=false
 YARA_TARGET=""
 BB_APPLETS=""
 
@@ -2052,15 +2272,12 @@ MD5_BATCH_CNT=0
 YARA_BATCH_CNT=0
 HEUR_BATCH_CNT=0
 PE_BATCH_CNT=0
-# Larger than the hash/YARA batch size on purpose: grep -E -f's automaton
-# build cost is paid once per batch regardless of size, so bigger batches
-# amortize it over more files.
-HEUR_BATCH_SIZE=200
-# Section-hash lookup against mdb.tsv (which can be millions of lines for a
-# real ClamAV database) has a large fixed per-call I/O cost that grows
-# somewhat with pattern count too — empirically ~50 files' worth of
-# sections (~200-400 candidates) per call keeps things reasonable.
-PE_BATCH_SIZE=50
+# All batch sizes come from the main script (--batch-size/--heur-batch-size/
+# --pe-batch-size), defaulting to 50. Smaller batches mean smoother/more
+# incremental progress (threats appear as they're found instead of jumping
+# when a big batch completes) at some cost to throughput, since the fixed
+# per-call cost (building a grep/YARA match set) is amortized over fewer
+# files.
 
 # ----------------------------------------------------------------------------
 # MODULE: busybox wrapper (own copy — the worker runs as a separate bash
@@ -2096,6 +2313,14 @@ init_worker_state() {
         HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/rules.yarc"
     elif [ -f "$SIG_DIR/yara/index.yar" ]; then
         HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/index.yar"
+    fi
+
+    # YARA 4.0+ / YARA-X support --scan-list for batch scanning; older
+    # builds don't and need the symlink-directory fallback in
+    # process_yara_batch(). Probed once per worker, not once per batch.
+    YARA_HAS_SCAN_LIST=false
+    if [ "$HAS_YARA" = true ] && "$YARA_CMD" --help 2>&1 | bb grep -q -- "--scan-list"; then
+        YARA_HAS_SCAN_LIST=true
     fi
 }
 
@@ -2300,13 +2525,21 @@ do_file_type() {
 # ----------------------------------------------------------------------------
 log() { printf '[%s] %s\n' "$WORKER_ID" "$*" >> "$REPORT"; }
 
-# threat() — single entry point for any finding: logs it and, if enabled,
-# quarantines the file. Report line format ("TYPE|file|info") is unchanged
-# so build_report/print_report parsing still works.
+# threat() — single entry point for any finding: logs it, streams it
+# immediately to the persistent live report (so Ctrl+C/SIGTERM mid-scan
+# doesn't lose already-found results — see init_live_report in the main
+# script), and quarantines the file if enabled. Report line format
+# ("TYPE|file|info") is unchanged so build_report/print_report still work.
 threat() {
     local type="$1" file="$2" info="${3:-}"
     printf 'THREAT:%s|%s|%s\n' "$type" "$file" "$info" >> "$REPORT"
     THREATS_FOUND=$(( THREATS_FOUND + 1 ))
+    if [ -n "$LIVE_REPORT_FILE" ]; then
+        # Single printf = single write() syscall = atomic append even with
+        # multiple worker processes writing the same file concurrently, as
+        # long as the line stays under PIPE_BUF (a few KB) — safe here.
+        printf '[%s] [%s] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$type" "$file" "$info" >> "$LIVE_REPORT_FILE" 2>/dev/null
+    fi
     [ -n "$QUARANTINE_DIR" ] && quarantine_file "$file" "$type"
 }
 
@@ -2382,42 +2615,59 @@ process_hash_batch() {
 process_yara_batch() {
     [ $# -eq 0 ] || [ "$HAS_YARA" = false ] || [ "$YARA_CMD" = "none" ] && return
 
-    # FIX: the yara CLI only takes ONE scan target (a file, or a directory
-    # with -r) — NOT a list of arbitrary file paths as trailing arguments.
-    # Passing several files the old way ("yara rules f1 f2 f3") errors out
-    # ("can't accept multiple rules files...") and silently produced zero
-    # matches every time (stderr discarded) — YARA detection never actually
-    # worked for batches of more than one file. Fix: symlink the batch into
-    # a throwaway directory and scan that with -r, same pattern already
-    # used for the strings/hex heuristic batch.
-    local tmpdir
-    tmpdir=$(mktemp -d 2>/dev/null) || return
-    local -a idx_to_file=()
-    local i=0 f
-    for f in "$@"; do
-        idx_to_file[$i]="$f"
-        ln -sf "$f" "$tmpdir/$i" 2>/dev/null
-        i=$((i + 1))
-    done
-
     local yara_out yara_flags=(-d filename= -d filepath= -d extension=)
     # A compiled ruleset (.yarc) MUST be loaded with -C, or yara tries to
     # parse the binary as rule *source* and fails outright.
     case "$YARA_TARGET" in
         *.yarc) yara_flags+=(-C) ;;
     esac
-    yara_out=$($YARA_CMD "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
+
+    if [ "$YARA_HAS_SCAN_LIST" = true ]; then
+        # YARA 4.0+/YARA-X: --scan-list takes a plain text file of paths
+        # (one per line) and scans them in one call with the ruleset
+        # loaded/compiled ONCE for the whole batch — this is what LMD's own
+        # docs point to for exactly this problem ("YARA CLI can't take a
+        # list of arbitrary files directly"). Simpler and a bit faster
+        # end-to-end than the symlink-directory fallback below, since it
+        # skips one filesystem syscall (symlink create) per file.
+        local listfile
+        listfile=$(mktemp 2>/dev/null) || return
+        printf '%s\n' "$@" > "$listfile"
+        yara_out=$($YARA_CMD "${yara_flags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        rm -f "$listfile"
+    else
+        # Fallback for older yara builds without --scan-list: the CLI only
+        # accepts ONE scan target (a file, or a directory with -r), so
+        # symlink the whole batch into a throwaway directory and scan that.
+        local tmpdir
+        tmpdir=$(mktemp -d 2>/dev/null) || return
+        local f
+        for f in "$@"; do
+            ln -sf "$f" "$tmpdir/$(bb basename "$f" 2>/dev/null || basename "$f")_$RANDOM" 2>/dev/null
+        done
+        yara_out=$($YARA_CMD "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
+        # Symlink names don't map back to real paths 1:1 in this fallback
+        # path (RANDOM-suffixed to avoid collisions) — resolve via readlink.
+        if [ -n "$yara_out" ]; then
+            yara_out=$(echo "$yara_out" | while IFS= read -r l; do
+                [ -z "$l" ] && continue
+                r=$(echo "$l" | awk '{print $1}')
+                p=$(echo "$l" | cut -d' ' -f2-)
+                real=$(readlink -f "$p" 2>/dev/null || echo "$p")
+                echo "$r $real"
+            done)
+        fi
+        rm -rf "$tmpdir"
+    fi
+
     if [ -n "$yara_out" ]; then
         while IFS= read -r yline; do
             [ -z "$yline" ] && continue
             local yrule; yrule=$(echo "$yline" | awk '{print $1}')
-            local ylink; ylink=$(echo "$yline" | cut -d' ' -f2-)
-            local yi="${ylink##*/}"
-            local yfile="${idx_to_file[$yi]:-$ylink}"
+            local yfile; yfile=$(echo "$yline" | cut -d' ' -f2-)
             threat "YARA_MATCH" "$yfile" "rule=$yrule"
         done <<< "$yara_out"
     fi
-    rm -rf "$tmpdir"
 }
 
 # ----------------------------------------------------------------------------
@@ -2555,7 +2805,7 @@ run_scan_loop() {
             if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
                 BATCH_SHA+=("$file")
                 SHA_BATCH_CNT=$(( SHA_BATCH_CNT + 1 ))
-                if [ "$SHA_BATCH_CNT" -ge 50 ]; then
+                if [ "$SHA_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
                     process_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
                     BATCH_SHA=(); SHA_BATCH_CNT=0
                 fi
@@ -2563,7 +2813,7 @@ run_scan_loop() {
             if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
                 BATCH_MD5+=("$file")
                 MD5_BATCH_CNT=$(( MD5_BATCH_CNT + 1 ))
-                if [ "$MD5_BATCH_CNT" -ge 50 ]; then
+                if [ "$MD5_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
                     process_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
                     BATCH_MD5=(); MD5_BATCH_CNT=0
                 fi
@@ -2590,7 +2840,7 @@ run_scan_loop() {
             if [ "$skip_deep" = false ] && [ "$HAS_YARA" = true ]; then
                 BATCH_YARA+=("$file")
                 YARA_BATCH_CNT=$(( YARA_BATCH_CNT + 1 ))
-                if [ "$YARA_BATCH_CNT" -ge 50 ]; then
+                if [ "$YARA_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
                     process_yara_batch "${BATCH_YARA[@]}"
                     BATCH_YARA=(); YARA_BATCH_CNT=0
                 fi
