@@ -34,6 +34,35 @@
 #                            that point is still valid. Without -o, a
 #                            default ./av_scan_threats_<timestamp>.log is
 #                            used automatically (never silently discarded).
+#   --ignore-sigs FILE       Suppress noisy detections without editing
+#                            downloaded signature/rule files (which get
+#                            overwritten on the next -u). One ERE pattern
+#                            per line, matched against "TYPE|info" of each
+#                            detection. Default: signatures/ignore_sigs
+#                            (auto-created with a commented template).
+#   -X, --exclude PATH        Skip this file/directory entirely (repeat for
+#                            multiple: -X /path/one -X /path/two). The AV's
+#                            own install dir, signature dir, and quarantine
+#                            dir are always excluded automatically.
+#   -A, --scan-archives      Look inside archives (.zip/.jar/.tar/.tar.gz/
+#                            .tgz/.tar.bz2/.tar.xz/.gz/.bz2/.xz, plus .7z/
+#                            .rar if 7z/unrar is installed) — off by
+#                            default (extraction has real CPU/time cost and
+#                            some risk from malformed/huge archives, hence
+#                            the safety limits below). A detection inside
+#                            an archive is reported against the ARCHIVE
+#                            FILE itself (with the internal member path
+#                            noted), not a temp path, and quarantine (if
+#                            enabled) moves the whole archive.
+#   --archive-max-mb N        Skip archives bigger than this, compressed
+#                            (default: 200)
+#   --archive-max-extract-mb N Abort extraction past this much decompressed
+#                            data — defense against decompression/zip
+#                            bombs (default: 500)
+#   --archive-max-depth N     How many nested-archive levels to recurse
+#                            into, e.g. a zip containing a zip (default: 2)
+#   --archive-max-files N     Only scan the first N files inside one
+#                            archive (default: 2000)
 #   --no-ram                Force /tmp instead of /dev/shm
 #   --no-busybox            Fully disable busybox (no auto-download, no local
 #                            binary use) — system tools only
@@ -159,6 +188,24 @@ OUTPUT_FILE=""
 LIVE_REPORT_FILE=""    # persistent (outside WORK_DIR) file threats are
                         # appended to AS THEY'RE FOUND, so Ctrl+C/SIGTERM
                         # mid-scan doesn't lose already-detected results
+IGNORE_SIGS_FILE=""    # set in init_ignore_sigs(); patterns (ERE, one per
+                        # line) matched against "TYPE|info" of each threat —
+                        # a match suppresses that detection entirely (no
+                        # log, no quarantine). For noisy signatures/rules
+                        # that false-positive on specific legitimate
+                        # software (e.g. CMSes that ship obfuscated core
+                        # files for license protection, which structurally
+                        # resembles webshell obfuscation to generic YARA
+                        # heuristics). Same idea as LMD's ignore_sigs.
+EXCLUDE_PATHS=()        # -X/--exclude PATH (repeatable): extra paths/dirs
+                        # to skip. Always ALSO includes the scanner's own
+                        # install dir, signature dir, quarantine dir, and
+                        # report files — otherwise scanning a target that
+                        # happens to contain the AV's own installation
+                        # (e.g. scanning "/" or "/root") makes every YARA
+                        # rule/signature file detect ITSELF, since the
+                        # signature files literally contain the patterns
+                        # being searched for. See init_self_exclude().
 DO_UPDATE=false
 USE_RAM=true
 ALLOW_BUSYBOX=true
@@ -171,6 +218,13 @@ BATCH_SIZE=50          # files per hash/YARA batch — smaller = smoother
                         # some cost to throughput from more subprocess calls
 HEUR_BATCH_SIZE=50     # files per strings/hex heuristic batch
 PE_BATCH_SIZE=50       # files per PE-section (.mdb) batch
+SCAN_ARCHIVES=false     # -A/--scan-archives: opt-in (extraction has real
+                        # cost and some risk — see MODULE: archive scanning)
+ARCHIVE_MAX_MB=200      # skip archives bigger than this (compressed size)
+ARCHIVE_MAX_EXTRACT_MB=500 # abort extraction past this much decompressed
+                        # data — defense against decompression bombs
+ARCHIVE_MAX_DEPTH=2     # how many nested-archive levels to recurse into
+ARCHIVE_MAX_FILES=2000  # only scan the first N files inside one archive
 DO_SETUP=false         # --setup: build yara/yarac (and fetch busybox) then exit
 SETUP_FORCE=false       # --setup --force: rebuild even if already present
 SETUP_COMPILE_ONLY=false # --setup --compile: skip --yara-url, always compile
@@ -226,6 +280,7 @@ MONITOR_PID=""
 TF=0            # files scanned (total across workers)
 TT=0            # threats found (total across workers)
 QC=0            # quarantined (total across workers)
+SC=0            # suppressed by ignore_sigs (total across workers)
 SPEED=0
 RPT=""          # final report text
 
@@ -739,6 +794,13 @@ parse_args() {
             -s|--sigs)       SIGNATURES="$2"; shift 2 ;;
             -m|--max-size)   MAX_SCAN_MB="$2"; shift 2 ;;
             -o|--output)     OUTPUT_FILE="$2"; shift 2 ;;
+            --ignore-sigs)   IGNORE_SIGS_FILE="$2"; shift 2 ;;
+            -X|--exclude)    EXCLUDE_PATHS+=("$2"); shift 2 ;;
+            -A|--scan-archives)  SCAN_ARCHIVES=true; shift ;;
+            --archive-max-mb)         ARCHIVE_MAX_MB="$2"; shift 2 ;;
+            --archive-max-extract-mb) ARCHIVE_MAX_EXTRACT_MB="$2"; shift 2 ;;
+            --archive-max-depth)      ARCHIVE_MAX_DEPTH="$2"; shift 2 ;;
+            --archive-max-files)      ARCHIVE_MAX_FILES="$2"; shift 2 ;;
             --no-ram)        USE_RAM=false; shift ;;
             --no-busybox)    ALLOW_BUSYBOX=false; shift ;;
             -b|--busybox)    BUSYBOX_PATH_ARG="$2"; shift 2 ;;
@@ -832,6 +894,42 @@ init_quarantine() {
 
 count_quarantined() {
     bb grep -h "QUARANTINED:" "$WORK_DIR/reports"/*.txt 2>/dev/null | bb wc -l | tr -d ' '
+}
+
+count_suppressed() {
+    bb grep -h "^SUPPRESSED:" "$WORK_DIR/reports"/*.txt 2>/dev/null | cut -d: -f2 | \
+        awk '{s+=$1} END {print s+0}'
+}
+
+# Locates (or creates, with a helpful commented template) the ignore_sigs
+# file — patterns that suppress specific noisy detections without editing
+# downloaded signature/rule files (which get overwritten on the next -u).
+# Same idea as LMD's ignore_sigs: https://github.com/rfxn/linux-malware-detect
+init_ignore_sigs() {
+    [ -n "$IGNORE_SIGS_FILE" ] || IGNORE_SIGS_FILE="${SIGNATURES}/ignore_sigs"
+
+    if [ ! -f "$IGNORE_SIGS_FILE" ]; then
+        mkdir -p "$(dirname "$IGNORE_SIGS_FILE")" 2>/dev/null
+        cat << 'EOF' > "$IGNORE_SIGS_FILE" 2>/dev/null
+# Oprhus AV Scanner — ignore_sigs
+#
+# One extended-regex (ERE) pattern per line, matched against
+# "TYPE|info" of each detection (e.g. "YARA_MATCH|rule=WEBSHELL_PHP_Dynamic_Big"
+# or "SIG_STRING_MATCH|pattern=chmod 777"). A match SUPPRESSES that
+# detection entirely — no log entry, no quarantine. Patterns match as
+# substrings, so "WEBSHELL_PHP_Dynamic_Big" also matches
+# "WEBSHELL_PHP_Dynamic_Big_v2" — anchor with ^/$ for an exact match.
+#
+# Use this for signatures/rules that are individually too broad for your
+# specific software (e.g. a CMS that ships obfuscated/encoded core files
+# for license protection — generic webshell-obfuscation heuristics can't
+# tell that apart from an actual backdoor by pattern alone).
+#
+# Examples (uncomment to use):
+# rule=WEBSHELL_PHP_Dynamic_Big
+# rule=WEBSHELL_PHP_Encoded_Big
+EOF
+    fi
 }
 
 # Sets up a persistent live threat log OUTSIDE WORK_DIR (which cleanup()
@@ -962,7 +1060,6 @@ eval(base64_decode
 bash -i >
 nc -e /bin
 python -c import socket
-chmod 777
 PHPDATA.*mbd;[0-9-]+\s*<\/PHPDATA>
 round\((\d+\.?\d*\+?){2,}\)
 goto [A-Za-z0-9_]+;
@@ -1203,13 +1300,17 @@ compile_signatures() {
     echo -e "[*] Compiling signatures into flat artifacts..."
 
     # Built-in heuristics
+    # FIX (real false positives reported): "chmod 777" as a bare literal
+    # string was removed — it matched plain INSTALLATION INSTRUCTIONS in
+    # docs/language files (e.g. "chmod 777 the cache/ folder"), not just
+    # malicious code. The remaining patterns are specific reverse-shell /
+    # backdoor indicators unlikely to appear in legitimate documentation.
     cat << 'EOF' > "$out_dir/strings.txt"
 eval(base64_decode
 /bin/sh -i
 bash -i >
 nc -e /bin
 python -c import socket
-chmod 777 /
 EOF
 
     touch "$out_dir/sha256.tsv" "$out_dir/md5.tsv" "$out_dir/hex_ere.txt" "$out_dir/b64_payloads.tsv" "$out_dir/mdb.tsv"
@@ -1812,6 +1913,28 @@ print_banner() {
 collect_files() {
     echo -e "[*] Collecting file tree..."
     local excl=(-not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*")
+
+    # Always exclude the scanner's own footprint (install dir, signature
+    # dir, quarantine dir, live report file) — otherwise scanning a target
+    # that happens to contain the AV's own installation makes every YARA
+    # rule/signature file "detect" itself, since it literally contains the
+    # patterns being searched for (confirmed in practice: scanning "/"
+    # produced hundreds of self-matches against signatures/yara/*.yar).
+    local self_paths=("$SCRIPT_DIR" "$SIGNATURES")
+    [ "$QUARANTINE_ENABLED" = true ] && self_paths+=("$QUARANTINE_DIR")
+    local p
+    for p in "${self_paths[@]}"; do
+        [ -n "$p" ] && excl+=(-not -path "$p" -not -path "${p}/*")
+    done
+    for p in "$LIVE_REPORT_FILE" "$OUTPUT_FILE"; do
+        [ -n "$p" ] && excl+=(-not -path "$p")
+    done
+
+    # User-specified extra exclusions (-X/--exclude, repeatable)
+    for p in "${EXCLUDE_PATHS[@]}"; do
+        [ -n "$p" ] && excl+=(-not -path "$p" -not -path "${p}/*")
+    done
+
     if [ "$OS" = "linux" ] && bb find "$SCRIPT_DIR" -maxdepth 0 -printf "" 2>/dev/null; then
         bb find "$ROOT_DIR" -type f "${excl[@]}" -printf "%s\t%m\t%p\n" 2>/dev/null > "$WORK_DIR/all_files.tsv"
     else
@@ -1838,7 +1961,7 @@ launch_workers() {
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
             "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
             "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" &
+            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" &
         WORKER_PIDS+=($!)
     done
 }
@@ -1962,7 +2085,7 @@ cleanup() {
 # ============================================================================
 build_report() {
     ELAPSED_S=$(( (END_MS - START_MS) / 1000 ))
-    TF=0; TT=0
+    TF=0; TT=0; SC=0
     local r f t
     for r in "$WORK_DIR/reports"/pool_*.txt; do
         [ -f "$r" ] || continue
@@ -1970,6 +2093,7 @@ build_report() {
         t=$(bb grep "^THREATS_FOUND:" "$r" 2>/dev/null | cut -d: -f2)
         TF=$(( TF + ${f:-0} )); TT=$(( TT + ${t:-0} ))
     done
+    SC=$(count_suppressed)
     SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
 
     QC=0
@@ -1977,6 +2101,9 @@ build_report() {
     local quarantine_line=""
     [ "$QUARANTINE_ENABLED" = true ] && quarantine_line="
  Quarantined        : $QC ($QUARANTINE_DIR)"
+    local suppressed_line=""
+    [ "${SC:-0}" -gt 0 ] 2>/dev/null && suppressed_line="
+ Suppressed (ignore_sigs): $SC ($IGNORE_SIGS_FILE)"
 
     RPT="
 =================================================
@@ -1985,7 +2112,7 @@ build_report() {
  OS / Arch          : $OS / $ARCH
  Target             : $ROOT_DIR
  Files Scanned      : $TF
- Threats Found      : $TT${quarantine_line}
+ Threats Found      : $TT${quarantine_line}${suppressed_line}
  Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
  Avg Speed          : ${SPEED} files/s
  Workers            : $WORKERS
@@ -2054,7 +2181,7 @@ start_realtime_worker() {
         "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
         "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
         "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" &
+        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" &
     REALTIME_WORKER_PID=$!
 
     # Keep the write fd (3) open permanently — opening/closing per event
@@ -2176,6 +2303,7 @@ main() {
     init_workdir
     check_deps
     init_quarantine
+    init_ignore_sigs
 
     extract_worker
     compile_signatures "$SIGNATURES" "$SIG_DIR"
@@ -2244,11 +2372,21 @@ PE_BATCH_SIZE="${17:-50}"     # files per PE-section (.mdb) batch
 LIVE_REPORT_FILE="${18:-}"    # persistent live threat log (outside the
                                # ephemeral WORK_DIR) — written to immediately
                                # as each threat is found, see threat() below
+IGNORE_SIGS_FILE="${19:-}"    # ERE patterns that suppress noisy detections
+                               # entirely — see init_ignore_sigs in the main
+                               # script
+SCAN_ARCHIVES="${20:-false}"
+ARCHIVE_MAX_MB="${21:-200}"
+ARCHIVE_MAX_EXTRACT_MB="${22:-500}"
+ARCHIVE_MAX_DEPTH="${23:-2}"
+ARCHIVE_MAX_FILES="${24:-2000}"
+ARCHIVE_DEPTH_CUR=0            # current recursion depth, tracked at runtime
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
 FILES_SCANNED=0
 THREATS_FOUND=0
+SUPPRESSED_FOUND=0
 MAX_SIZE=$(( MAX_SCAN_MB * 1024 * 1024 ))
 
 HAS_SHA256=false
@@ -2467,6 +2605,56 @@ _bash_strings() {
     '
 }
 
+# ----------------------------------------------------------------------------
+# MODULE: package-manager integrity check (dpkg/rpm)
+#
+# Verifies a file against the distro's own package checksum database.
+# Result cached per-worker: dpkg -S/-V calls aren't free, but SUID/SGID
+# files are rare (dozens, not thousands) so per-file cost is negligible.
+# ----------------------------------------------------------------------------
+declare -A _PKG_VERIFY_CACHE 2>/dev/null
+_verify_package_file() {
+    local file="$1"
+    [ -n "${_PKG_VERIFY_CACHE[$file]:-}" ] && { echo "${_PKG_VERIFY_CACHE[$file]}"; return; }
+
+    local result="unowned"
+    if command -v dpkg &>/dev/null; then
+        local pkg
+        pkg=$(dpkg -S "$file" 2>/dev/null | head -1 | cut -d: -f1)
+        if [ -n "$pkg" ]; then
+            local md5file="/var/lib/dpkg/info/${pkg}.md5sums"
+            [ -f "$md5file" ] || md5file="/var/lib/dpkg/info/${pkg%:*}.md5sums"
+            if [ -f "$md5file" ]; then
+                local relpath="${file#/}"
+                local expected
+                expected=$(bb grep -F "  ${relpath}" "$md5file" 2>/dev/null | awk '{print $1}' | head -1)
+                if [ -n "$expected" ]; then
+                    local actual
+                    actual=$(bb md5sum "$file" 2>/dev/null | bb grep -oE '[0-9a-f]{32}' | head -1)
+                    if [ "$expected" = "$actual" ]; then
+                        result="verified"
+                    else
+                        result="tampered"
+                    fi
+                fi
+            fi
+        fi
+    elif command -v rpm &>/dev/null; then
+        if rpm -qf "$file" &>/dev/null; then
+            local vout
+            vout=$(rpm -Vf "$file" 2>/dev/null)
+            if [ -z "$vout" ]; then
+                result="verified"
+            elif echo "$vout" | bb grep -q "^..5"; then
+                result="tampered"
+            fi
+        fi
+    fi
+
+    _PKG_VERIFY_CACHE[$file]="$result"
+    echo "$result"
+}
+
 _bash_file_type() {
     local magic
     magic=$(bb dd if="$1" bs=8 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n')
@@ -2485,6 +2673,156 @@ _bash_file_type() {
         2321*)     echo "SCRIPT" ;;
         *)         echo "UNKNOWN";;
     esac
+}
+
+# ----------------------------------------------------------------------------
+# MODULE: archive scanning (-A/--scan-archives, opt-in)
+#
+# Extracts supported archive types into a throwaway directory and runs each
+# extracted member through the SAME hash/YARA/string checks used for real
+# files. Detections are reported against the ARCHIVE FILE itself (not the
+# transient extracted path — that stops existing once the scan ends), with
+# the internal member path in the info field, so the user always has a
+# real, persistent file to act on. If quarantine is enabled, the WHOLE
+# ARCHIVE gets quarantined (moving just the extracted copy would leave the
+# infected archive sitting right where it was).
+#
+# Safety limits (all overridable via CLI flags — see usage):
+#   - skip archives bigger than ARCHIVE_MAX_MB compressed
+#   - abort extraction past ARCHIVE_MAX_EXTRACT_MB decompressed (bomb guard)
+#   - only look at the first ARCHIVE_MAX_FILES members
+#   - only recurse ARCHIVE_MAX_DEPTH levels into nested archives
+#   - every extraction command runs under `timeout`, so a malformed/hostile
+#     archive can't hang a worker indefinitely
+# ----------------------------------------------------------------------------
+_archive_type() {
+    case "${1,,}" in
+        *.tar.gz|*.tgz)   echo "targz" ;;
+        *.tar.bz2|*.tbz2) echo "tarbz2" ;;
+        *.tar.xz|*.txz)   echo "tarxz" ;;
+        *.tar)            echo "tar" ;;
+        *.zip|*.jar|*.war|*.apk|*.ear) echo "zip" ;;
+        *.gz)             echo "gz" ;;
+        *.bz2)            echo "bz2" ;;
+        *.xz)             echo "xz" ;;
+        *.7z)             command -v 7z &>/dev/null && echo "7z" ;;
+        *.rar)            { command -v unrar &>/dev/null || command -v 7z &>/dev/null; } && echo "rar" ;;
+        *) ;;
+    esac
+}
+
+_archive_extract() {
+    local archive="$1" atype="$2" extract_dir="$3"
+    case "$atype" in
+        zip)    timeout 30 bb unzip -qq -o "$archive" -d "$extract_dir" 2>/dev/null ;;
+        tar)    timeout 30 bb tar -xf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        targz)  timeout 30 bb tar -xzf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        tarbz2) timeout 30 bb tar -xjf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        tarxz)  timeout 30 bb tar -xJf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        gz)     timeout 30 bb gunzip -c "$archive" > "$extract_dir/$(basename "${archive%.gz}")" 2>/dev/null ;;
+        bz2)    timeout 30 bunzip2 -c "$archive" > "$extract_dir/$(basename "${archive%.bz2}")" 2>/dev/null ;;
+        xz)     timeout 30 unxz -c "$archive" > "$extract_dir/$(basename "${archive%.xz}")" 2>/dev/null ;;
+        7z)     timeout 30 7z x -y -o"$extract_dir" "$archive" &>/dev/null ;;
+        rar)
+            if command -v unrar &>/dev/null; then
+                timeout 30 unrar x -y "$archive" "$extract_dir/" &>/dev/null
+            else
+                timeout 30 7z x -y -o"$extract_dir" "$archive" &>/dev/null
+            fi
+            ;;
+    esac
+}
+
+# Checks ONE extracted file (from inside an archive) against hash/YARA/
+# string signatures and reports against the ORIGINAL ARCHIVE if it matches.
+# Not batched (archives are opt-in / lower volume than the main file
+# stream), so this does direct per-file checks rather than queueing into
+# the shared BATCH_* arrays.
+_scan_archive_member() {
+    local archive="$1" member_path="$2" rel="$3"
+    local msize
+    msize=$(_stat_size "$member_path" 2>/dev/null) || return
+    [ "${msize:-0}" -gt "$MAX_SIZE" ] && return
+
+    if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
+        local h
+        h=$($SHA256_CMD "$member_path" 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
+        if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/sha256.tsv" 2>/dev/null; then
+            local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/sha256.tsv" | cut -f2)
+            threat "KNOWN_MALWARE" "$archive" "archive_member=${rel}|name=${n:-Malware}|sha256=$h"
+            return
+        fi
+    fi
+    if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
+        local h
+        h=$($MD5_CMD "$member_path" 2>/dev/null | bb grep -oE '[0-9a-f]{32}' | head -1)
+        if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/md5.tsv" 2>/dev/null; then
+            local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/md5.tsv" | cut -f2)
+            threat "KNOWN_MALWARE" "$archive" "archive_member=${rel}|name=${n:-Malware}|md5=$h"
+            return
+        fi
+    fi
+    if [ "$HAS_YARA" = true ]; then
+        local yflags=(-d filename= -d filepath= -d extension=) yhit
+        case "$YARA_TARGET" in *.yarc) yflags+=(-C) ;; esac
+        yhit=$($YARA_CMD "${yflags[@]}" "$YARA_TARGET" "$member_path" 2>/dev/null | head -1 | awk '{print $1}')
+        [ -n "$yhit" ] && { threat "YARA_MATCH" "$archive" "archive_member=${rel}|rule=$yhit"; return; }
+    fi
+    if [ "$HAS_STRINGS" = true ]; then
+        local sm
+        sm=$(do_strings "$member_path" 6 524288 | bb grep -F -i -f "$SIG_DIR/strings.txt" 2>/dev/null | head -1)
+        [ -n "$sm" ] && threat "SIG_STRING_MATCH" "$archive" "archive_member=${rel}|pattern=${sm:0:50}"
+    fi
+
+    # Nested archive? Recurse up to the configured depth limit.
+    if [ "$ARCHIVE_DEPTH_CUR" -lt "$ARCHIVE_MAX_DEPTH" ]; then
+        local atype2
+        atype2=$(_archive_type "$member_path")
+        if [ -n "$atype2" ]; then
+            ARCHIVE_DEPTH_CUR=$(( ARCHIVE_DEPTH_CUR + 1 ))
+            scan_archive "$archive" "$member_path" "$rel"
+            ARCHIVE_DEPTH_CUR=$(( ARCHIVE_DEPTH_CUR - 1 ))
+        fi
+    fi
+}
+
+# scan_archive TOP_ARCHIVE [CURRENT_FILE] [CURRENT_REL]
+# TOP_ARCHIVE is always the real, original archive file to report against.
+# CURRENT_FILE/CURRENT_REL are set when called recursively for a nested
+# archive found inside an already-extracted one.
+scan_archive() {
+    local top_archive="$1" cur="${2:-$1}" cur_rel="${3:-}"
+    [ "$SCAN_ARCHIVES" = "true" ] || return
+
+    local asize
+    asize=$(_stat_size "$cur" 2>/dev/null) || return
+    [ "${asize:-0}" -gt $(( ARCHIVE_MAX_MB * 1024 * 1024 )) ] && return
+
+    local atype
+    atype=$(_archive_type "$cur")
+    [ -z "$atype" ] && return
+
+    local extract_dir
+    extract_dir=$(mktemp -d 2>/dev/null) || return
+
+    _archive_extract "$cur" "$atype" "$extract_dir"
+
+    local extracted_kb
+    extracted_kb=$(du -sk "$extract_dir" 2>/dev/null | awk '{print $1}')
+    if [ -n "$extracted_kb" ] && [ "$extracted_kb" -gt $(( ARCHIVE_MAX_EXTRACT_MB * 1024 )) ]; then
+        log "Archive extraction exceeded ${ARCHIVE_MAX_EXTRACT_MB}MB cap, scan may be incomplete: $top_archive"
+    fi
+
+    local inner rel n=0
+    while IFS= read -r -d '' inner; do
+        n=$(( n + 1 ))
+        [ "$n" -gt "$ARCHIVE_MAX_FILES" ] && break
+        rel="${inner#$extract_dir/}"
+        [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+        _scan_archive_member "$top_archive" "$inner" "$rel"
+    done < <(find "$extract_dir" -type f -print0 2>/dev/null)
+
+    rm -rf "$extract_dir"
 }
 
 do_strings() {
@@ -2525,13 +2863,23 @@ do_file_type() {
 # ----------------------------------------------------------------------------
 log() { printf '[%s] %s\n' "$WORKER_ID" "$*" >> "$REPORT"; }
 
-# threat() — single entry point for any finding: logs it, streams it
-# immediately to the persistent live report (so Ctrl+C/SIGTERM mid-scan
-# doesn't lose already-found results — see init_live_report in the main
-# script), and quarantines the file if enabled. Report line format
-# ("TYPE|file|info") is unchanged so build_report/print_report still work.
+# threat() — single entry point for any finding: checks ignore_sigs first
+# (a match suppresses the detection entirely — no log, no quarantine), then
+# logs it, streams it immediately to the persistent live report (so
+# Ctrl+C/SIGTERM mid-scan doesn't lose already-found results — see
+# init_live_report in the main script), and quarantines the file if
+# enabled. Report line format ("TYPE|file|info") is unchanged so
+# build_report/print_report still work.
 threat() {
     local type="$1" file="$2" info="${3:-}"
+
+    if [ -n "$IGNORE_SIGS_FILE" ] && [ -s "$IGNORE_SIGS_FILE" ]; then
+        if printf '%s|%s\n' "$type" "$info" | bb grep -qE -f "$IGNORE_SIGS_FILE" 2>/dev/null; then
+            SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
+            return
+        fi
+    fi
+
     printf 'THREAT:%s|%s|%s\n' "$type" "$file" "$info" >> "$REPORT"
     THREATS_FOUND=$(( THREATS_FOUND + 1 ))
     if [ -n "$LIVE_REPORT_FILE" ]; then
@@ -2601,7 +2949,7 @@ process_hash_batch() {
         while IFS= read -r hit_hash; do
             [ -z "$hit_hash" ] && continue
             local tname
-            tname=$(bb grep -F -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -d$'\t' -f2)
+            tname=$(bb grep -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -f2)
             local hit_file
             hit_file=$(printf '%s\n' "$out" | bb grep -iE "^${hit_hash}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
             [ -n "$hit_file" ] && threat "KNOWN_MALWARE" "$hit_file" "name=${tname:-Malware}|$htype=$hit_hash"
@@ -2731,27 +3079,67 @@ check_file_heuristics() {
     local file="$1" size="$2" oct="$3"
 
     if [ "$size" -lt "$MAX_SIZE" ]; then
-        # Base64 payloads
+        # Base64 payloads. PERFORMANCE FIX: real-world PHP/JS codebases are
+        # full of LEGITIMATE 40+ char base64-looking substrings (inline
+        # images, fonts, JWT tokens, minified data) — the old order did
+        # mktemp+decode+sha256sum+grep (4 forks) for EVERY match BEFORE even
+        # checking if it looked executable, which dominated per-file cost
+        # on such codebases. Now: check magic bytes FIRST (cheap, 1 read,
+        # no extra fork beyond the decode itself) and skip immediately for
+        # anything that isn't ELF/PE/script-shaped — the expensive
+        # hash-lookup and YARA checks only run on the small subset that
+        # actually looks like an embedded executable. Also raised the
+        # minimum match length (40->200 chars: a functional embedded
+        # ELF/PE header needs real size, so short matches are almost always
+        # incidental, not real payloads) and lowered the match cap (20->8)
+        # to cut down on candidates entirely.
         while IFS= read -r chunk; do
             [ -z "$chunk" ] && continue
+            local b64tmp
+            b64tmp=$(mktemp 2>/dev/null) || continue
+            printf '%s' "$chunk" | _b64decode > "$b64tmp" 2>/dev/null
+            [ -s "$b64tmp" ] || { rm -f "$b64tmp"; continue; }
+
+            local magic
+            magic=$(bb od -An -tx1 -v "$b64tmp" 2>/dev/null | head -1 | tr -d ' \n')
+            case "$magic" in
+                7f454c46*|4d5a*|2321*)
+                    : # falls through to the checks below
+                    ;;
+                *)
+                    rm -f "$b64tmp"
+                    continue
+                    ;;
+            esac
+
             if [ "$HAS_B64" = true ] && [ "$SHA256_CMD" != "none" ]; then
                 local dh
-                dh=$(printf '%s' "$chunk" | _b64decode | _sha256_stdin)
+                dh=$($SHA256_CMD "$b64tmp" 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
                 if [ -n "$dh" ] && bb grep -qF "$dh" "$SIG_DIR/b64_payloads.tsv" 2>/dev/null; then
                     local bname
-                    bname=$(bb grep -F -m 1 "^$dh" "$SIG_DIR/b64_payloads.tsv" | cut -d$'\t' -f2)
+                    bname=$(bb grep -m 1 "^$dh" "$SIG_DIR/b64_payloads.tsv" | cut -f2)
                     threat "KNOWN_B64_PAYLOAD" "$file" "name=${bname:-B64.Malware}|b64=${chunk:0:20}..."
+                    rm -f "$b64tmp"
                     continue
                 fi
             fi
-            local magic
-            magic=$(printf '%s' "$chunk" | _b64decode 2>/dev/null | bb dd bs=8 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n')
-            case "$magic" in
-                7f454c46*) threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=ELF|b64=${chunk:0:20}..." ;;
-                4d5a*)     threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=PE_MZ|b64=${chunk:0:20}..." ;;
-                2321*)     threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=SCRIPT|b64=${chunk:0:20}..." ;;
-            esac
-        done < <(bb grep -oE '[A-Za-z0-9+/]{40,}={0,2}' "$file" 2>/dev/null | head -20)
+
+            local dtype="SCRIPT"
+            case "$magic" in 7f454c46*) dtype="ELF" ;; 4d5a*) dtype="PE_MZ" ;; esac
+            if [ "$HAS_YARA" = true ]; then
+                local yara_flags3=(-d filename= -d filepath= -d extension=) yhit
+                case "$YARA_TARGET" in *.yarc) yara_flags3+=(-C) ;; esac
+                yhit=$($YARA_CMD "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
+                [ -n "$yhit" ] && threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|yara=${yhit}|b64=${chunk:0:20}..."
+                # No YARA hit on the decoded content -> an embedded
+                # executable alone isn't enough signal, stay quiet.
+            else
+                # No YARA available to cross-check -> fall back to
+                # the older, weaker magic-bytes-only signal.
+                threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|b64=${chunk:0:20}..."
+            fi
+            rm -f "$b64tmp"
+        done < <(bb grep -oE '[A-Za-z0-9+/]{200,}={0,2}' "$file" 2>/dev/null | head -8)
     fi
 
     # Disguised
@@ -2774,7 +3162,27 @@ check_file_heuristics() {
     if [ -n "$oct" ] && [ "$oct" != "0" ]; then
         oct="0000${oct}"
         oct="${oct: -4}"
-        (( 8#$oct & 8#6000 )) 2>/dev/null && threat "SUID_SGID" "$file" "perms=$oct"
+        if (( 8#$oct & 8#6000 )) 2>/dev/null; then
+            # SUID/SGID on standard system binaries (sudo, su, mount, passwd,
+            # ...) is EXPECTED — every Linux install has these, so flagging
+            # them on every scan of a system directory is pure noise. But a
+            # virus/rootkit REPLACING one of those binaries is exactly what
+            # we want to still catch. The distro package manager already
+            # keeps a checksum database for this — use it: if the file is
+            # package-owned AND its checksum matches the package's record,
+            # it is verified legitimate and suppressed; if it's unowned,
+            # unverifiable, or the checksum DOESN'T match, it's reported
+            # (with 'unverified' or 'TAMPERED' noted, since a checksum
+            # mismatch on a package-owned SUID binary is a strong compromise
+            # indicator, not a minor discrepancy).
+            local suid_status
+            suid_status=$(_verify_package_file "$file")
+            case "$suid_status" in
+                verified) : ;;  # known-good system binary, no report
+                tampered) threat "SUID_SGID" "$file" "perms=$oct|TAMPERED (fails package checksum verification)" ;;
+                *)        threat "SUID_SGID" "$file" "perms=$oct" ;;
+            esac
+        fi
         (( 8#$oct & 8#0002 )) 2>/dev/null && (( 8#$oct & 8#0111 )) 2>/dev/null && threat "WORLD_WRITABLE_EXEC" "$file" "perms=$oct"
     fi
 }
@@ -2868,6 +3276,14 @@ run_scan_loop() {
             fi
         fi
 
+        # Archive scanning (-A/--scan-archives) — deliberately OUTSIDE the
+        # MAX_SIZE gate above: archives are checked against their own,
+        # separate ARCHIVE_MAX_MB limit (typically larger than MAX_SIZE,
+        # since compressed archives commonly exceed the deep-inspection
+        # size cutoff for regular files). scan_archive() itself is a fast
+        # no-op for non-archive extensions and when -A wasn't passed.
+        [ "$SCAN_ARCHIVES" = "true" ] && scan_archive "$file"
+
         # Cheap per-file checks (base64 payloads, disguised ext, perms)
         check_file_heuristics "$file" "$size" "${oct:-0}"
 
@@ -2887,8 +3303,8 @@ run_scan_loop() {
 # ----------------------------------------------------------------------------
 finalize_worker() {
     progress "done"
-    printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" >> "$REPORT"
-    log "Completed - files: $FILES_SCANNED, threats: $THREATS_FOUND"
+    printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\nSUPPRESSED:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" "$SUPPRESSED_FOUND" >> "$REPORT"
+    log "Completed - files: $FILES_SCANNED, threats: $THREATS_FOUND, suppressed: $SUPPRESSED_FOUND"
     touch "${REPORT_DIR}/${WORKER_ID}.done"
 }
 
