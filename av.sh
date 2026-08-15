@@ -176,7 +176,7 @@ export LC_ALL=C
 # 1. GLOBALS — all script variables defined once here, before any code uses
 #    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
-VERSION="6.4"
+VERSION="0.1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # --- CLI-configured params (defaults, overridable via parse_args) ---
@@ -212,12 +212,15 @@ ALLOW_BUSYBOX=true
 MB_KEY=""
 WORKERS=""            # empty = "auto", resolved in init_workers()
 MAX_HEX_PATTERNS=8000 # cap on compiled hex_ere.txt entries, see compile_signatures
-BATCH_SIZE=50          # files per hash/YARA batch — smaller = smoother
-                        # progress updates (threats appear more incrementally
-                        # instead of jumping when a big batch finishes), at
-                        # some cost to throughput from more subprocess calls
-HEUR_BATCH_SIZE=50     # files per strings/hex heuristic batch
-PE_BATCH_SIZE=50       # files per PE-section (.mdb) batch
+# Batch sizes: real-world testing showed the smaller "smoother progress"
+# defaults (50) cost real throughput on weaker hardware — a slow VPS
+# genuinely bottlenecks on the fixed per-call cost of grep/yara being paid
+# more often, not just perceived choppiness. Raised the defaults back up;
+# --batch-size/--heur-batch-size/--pe-batch-size are still there for anyone
+# who wants smoother-but-slower progress updates instead.
+BATCH_SIZE=200         # files per hash/YARA batch
+HEUR_BATCH_SIZE=200    # files per strings/hex heuristic batch
+PE_BATCH_SIZE=100      # files per PE-section (.mdb) batch
 SCAN_ARCHIVES=false     # -A/--scan-archives: opt-in (extraction has real
                         # cost and some risk — see MODULE: archive scanning)
 ARCHIVE_MAX_MB=200      # skip archives bigger than this (compressed size)
@@ -261,6 +264,8 @@ SHA256_CMD="none"
 MD5_CMD="none"
 YARA_CMD="none"
 YARAC_BIN=""           # path to yarac (compile-time only; empty = not found
+GREP_BIN=""            # bundled static grep (bin/grep, see --setup); empty
+                        # = fall back to whatever "grep" resolves to on PATH
 
 # --- Runtime work paths (filled by init_workdir) ---
 WORK_DIR=""
@@ -588,6 +593,15 @@ check_dependencies_report() {
         echo "         Fix: run '$0 --setup' to build them automatically"
         echo "         (needs a C toolchain, or the ability to install one)."
     fi
+
+    if [ -x "$SCRIPT_DIR/bin/grep" ]; then
+        echo "  [OK]   grep : bundled at bin/grep (static GNU grep)"
+    else
+        echo "  [WARN] grep : not bundled, using system/busybox grep instead —"
+        echo "         busybox's grep is known to silently miss matches in"
+        echo "         files containing NUL bytes, even with -a (confirmed)."
+        echo "         Fix: run '$0 --setup' to build a bundled static grep."
+    fi
     echo ""
 }
 
@@ -754,9 +768,92 @@ build_yara_from_source() {
     return 0
 }
 
+# Builds a fully static GNU grep from source. Unlike YARA (dynamically
+# linked against libcrypto/libc/libm at best), grep has no such
+# dependencies once PCRE support is dropped — the result is a genuinely
+# static binary, zero runtime dependencies, guaranteed identical behavior
+# on every target machine regardless of whatever grep the OS ships.
+#
+# WHY THIS MATTERS (found empirically, not theoretically): busybox's grep
+# silently finds NOTHING in files containing NUL bytes, even with -a —
+# confirmed with a real repro (system grep found the match, busybox grep
+# didn't, no error either way). Since binary-safe string search is used
+# throughout scanning (webshells embedded in otherwise-binary files,
+# SIG_STRING_MATCH, base64 payload screening), a correctness gap here is
+# a real, silent detection gap — a bundled, known-good grep closes it for
+# good instead of hoping the OS's grep behaves.
+build_grep_from_source() {
+    local version="${SETUP_GREP_VERSION:-3.11}"
+
+    if [ -x "$SCRIPT_DIR/bin/grep" ] && [ "${SETUP_FORCE:-false}" != true ]; then
+        echo -e "${G}[OK] bin/grep already present -> nothing to do${Z}"
+        return 0
+    fi
+
+    if [ "$(id -u 2>/dev/null)" != "0" ] && ! command -v sudo &>/dev/null; then
+        echo -e "${R}[FAIL] Need root or sudo to install build dependencies${Z}"
+        return 1
+    fi
+    local as_root=""
+    [ "$(id -u 2>/dev/null)" != "0" ] && as_root="sudo"
+    _install_build_toolchain "$as_root" || return 1
+
+    local workdir
+    workdir=$(mktemp -d 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; return 1; }
+    echo "[*] Downloading GNU grep v${version} source..."
+    # Multiple official GNU mirrors — ftp.gnu.org occasionally rate-limits
+    # or is geo-blocked on some networks; falling through a short mirror
+    # list is cheap insurance against a one-off download failure.
+    local grep_urls=(
+        "https://ftp.gnu.org/gnu/grep/grep-${version}.tar.gz"
+        "https://mirror.team-cymru.com/gnu/grep/grep-${version}.tar.gz"
+        "https://mirrors.kernel.org/gnu/grep/grep-${version}.tar.gz"
+        "https://ftpmirror.gnu.org/grep/grep-${version}.tar.gz"
+    )
+    local fetched=false gurl
+    for gurl in "${grep_urls[@]}"; do
+        if net_fetch "$gurl" "$workdir/grep.tar.gz" 30; then
+            fetched=true
+            break
+        fi
+    done
+    if [ "$fetched" != true ]; then
+        echo -e "${R}[FAIL] Could not download grep source from any mirror (network?)${Z}"
+        rm -rf "$workdir"
+        return 1
+    fi
+    tar -xzf "$workdir/grep.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
+
+    (
+        cd "$workdir/grep-${version}" || exit 1
+        echo "[*] Configuring (no PCRE -> no external deps -> true static link)..."
+        ./configure --disable-perl-regexp LDFLAGS="-static" >/tmp/av_grep_setup_configure.log 2>&1 || exit 1
+        echo "[*] Building..."
+        make -j"$(nproc 2>/dev/null || echo 2)" >/tmp/av_grep_setup_make.log 2>&1 || exit 1
+        strip ./src/grep 2>/dev/null || true
+    )
+    local build_rc=$?
+
+    if [ $build_rc -ne 0 ] || [ ! -x "$workdir/grep-${version}/src/grep" ]; then
+        echo -e "${R}[FAIL] Build failed — see /tmp/av_grep_setup_configure.log and /tmp/av_grep_setup_make.log${Z}"
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    mkdir -p "$SCRIPT_DIR/bin"
+    cp "$workdir/grep-${version}/src/grep" "$SCRIPT_DIR/bin/grep"
+    chmod +x "$SCRIPT_DIR/bin/grep"
+    rm -rf "$workdir"
+
+    echo -e "${G}[OK] Built: $SCRIPT_DIR/bin/grep${Z}"
+    "$SCRIPT_DIR/bin/grep" --version | head -1
+    echo "     Dependencies: $(ldd "$SCRIPT_DIR/bin/grep" 2>&1 | head -1)"
+    return 0
+}
+
 run_self_setup() {
     echo -e "${B}=== av_scan.sh self-setup ===${Z}"
-    echo "Target: $SCRIPT_DIR/bin/{yara,yarac}"
+    echo "Target: $SCRIPT_DIR/bin/{yara,yarac,grep}"
     echo ""
 
     if [ -x "$SCRIPT_DIR/bin/yara" ] && [ -x "$SCRIPT_DIR/bin/yarac" ] && [ "${SETUP_FORCE:-false}" != true ]; then
@@ -769,6 +866,9 @@ run_self_setup() {
     else
         build_yara_from_source
     fi
+
+    echo ""
+    build_grep_from_source
 
     # busybox too, while we're setting things up, if it isn't there yet.
     if [ ! -x "$SCRIPT_DIR/bin/busybox" ]; then
@@ -1146,7 +1246,17 @@ run_awk_parallel() {
     line_cnt=$(wc -l < "$infile" 2>/dev/null || echo 0)
 
     if [ "$nproc_cmd" -le 1 ]; then
-        awk "$awk_code" "$infile" > "$outfile"
+        # FIX (real crash reproduced): plain system "awk" can silently BE
+        # mawk (Ubuntu/Debian's update-alternatives default) — confirmed
+        # mawk's regex engine both crashes outright on some ERE patterns
+        # this script generates (a bounded quantifier "{n}" immediately
+        # followed by a group, e.g. "{64}(:.*)?") AND silently
+        # mis-evaluates two-number range quantifiers like "{32,64}"
+        # (matches nothing, no error). busybox's awk handles both
+        # correctly — already used on the parallel (nproc>1) path below,
+        # so use it here too instead of whatever "awk" happens to resolve
+        # to on the host.
+        bb awk "$awk_code" "$infile" > "$outfile"
         return $?
     fi
 
@@ -1287,15 +1397,30 @@ compile_signatures() {
     # is always populated one way or another.
     local cache_dir="$sig_input/.cache"
     local compiled_flag="$cache_dir/.compiled"
+    local version_flag="$cache_dir/.compiled_version"
 
-    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ "$compiled_flag" -nt "$sig_input" ]; then
+    # FIX (real bug reported): the cache freshness check only compared
+    # mtimes — it had no idea the SCRIPT ITSELF changed (e.g. a built-in
+    # heuristic pattern was fixed/removed). Updating av.sh alone, without
+    # also running -u or clearing the cache, silently kept serving the
+    # OLD compiled strings.txt/rules forever, so script fixes never took
+    # effect for anyone reusing an existing signatures/ directory. Now the
+    # cache is also invalidated whenever VERSION doesn't match what it was
+    # compiled with.
+    local cached_version=""
+    [ -f "$version_flag" ] && cached_version=$(cat "$version_flag" 2>/dev/null)
+
+    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ "$compiled_flag" -nt "$sig_input" ] && [ "$cached_version" = "$VERSION" ]; then
         echo -e "[*] Signatures already compiled -> reusing cache ($cache_dir)"
         mkdir -p "$out_dir"
         cp -f "$cache_dir"/sha256.tsv "$cache_dir"/md5.tsv "$cache_dir"/hex_ere.txt \
-              "$cache_dir"/strings.txt "$cache_dir"/b64_payloads.tsv "$cache_dir"/mdb.tsv "$out_dir/" 2>/dev/null || true
+              "$cache_dir"/strings.txt "$cache_dir"/b64_payloads.tsv "$cache_dir"/mdb.tsv \
+              "$cache_dir"/str_sig_map.tsv "$out_dir/" 2>/dev/null || true
         [ -d "$cache_dir/yara" ] && cp -rf "$cache_dir/yara" "$out_dir/" 2>/dev/null
         return 0
     fi
+    [ -n "$cached_version" ] && [ "$cached_version" != "$VERSION" ] && \
+        echo -e "${Y}[*] av.sh version changed ($cached_version -> $VERSION) -> recompiling signatures${Z}"
 
     echo -e "[*] Compiling signatures into flat artifacts..."
 
@@ -1336,6 +1461,7 @@ EOF
             -not -path '*/.cache/*' \
             -not -name "*.pack" -not -name "*.idx" -not -name "*.cvd" \
             -not -name "*.yarc" -not -name "*.compiled" \
+            -not -name "*.yar" -not -name "*.yara" \
             -not -name "*.msb" -not -name "*.msu" \
             -not -name "*.cdb" -not -name "*.idb" -not -name "*.wdb" \
             -not -name "*.pdb" -not -name "*.gdb" -not -name "*.ftm" \
@@ -1658,18 +1784,39 @@ EOF
                 }
                 # Bare hash (e.g. maldet md5.dat/sha256v2.dat: one hash per
                 # line, optionally with a name after ":")
-                if (line ~ /^[0-9a-fA-F]{64}(:.*)?$/) {
-                    split(line, a, ":")
-                    print "SHA256\t" tolower(a[1]) "\t" (a[2] != "" ? a[2] : "Maldet.Hash")
-                    next
+                # NOTE: intentionally NOT written as
+                # /^[0-9a-fA-F]{64}(:.*)?$/ — mawk (Ubuntu/Debians default
+                # "awk" via update-alternatives) crashes outright compiling
+                # a bounded quantifier immediately followed by a group
+                # (confirmed: "REcompile() - panic: values still on
+                # machine stack"). length()+substr() sidesteps it, works
+                # identically on every awk implementation.
+                if (length(line) >= 64) {
+                    hexpart = substr(line, 1, 64)
+                    resthex = substr(line, 65)
+                    if (hexpart ~ /^[0-9a-fA-F]{64}$/ && (resthex == "" || substr(resthex,1,1) == ":")) {
+                        split(line, a, ":")
+                        print "SHA256\t" tolower(a[1]) "\t" (a[2] != "" ? a[2] : "Maldet.Hash")
+                        next
+                    }
                 }
-                if (line ~ /^[0-9a-fA-F]{32}(:.*)?$/) {
-                    split(line, a, ":")
-                    print "MD5\t" tolower(a[1]) "\t" (a[2] != "" ? a[2] : "Maldet.Hash")
-                    next
+                if (length(line) >= 32) {
+                    hexpart = substr(line, 1, 32)
+                    resthex = substr(line, 33)
+                    if (hexpart ~ /^[0-9a-fA-F]{32}$/ && (resthex == "" || substr(resthex,1,1) == ":")) {
+                        split(line, a, ":")
+                        print "MD5\t" tolower(a[1]) "\t" (a[2] != "" ? a[2] : "Maldet.Hash")
+                        next
+                    }
                 }
-                # ClamAV/Maldet-style "hash:size:name"
-                if (line ~ /^[0-9a-fA-F]{32,64}:[0-9*]+:/) {
+                # ClamAV/Maldet-style "hash:size:name". NOTE: not written
+                # as {32,64} — separately confirmed mawk silently fails to
+                # match ANY input against a two-number range quantifier
+                # like {32,64} (no crash, just never matches, which is
+                # arguably worse since it fails silently). "+" always
+                # works the same everywhere; length(h)==64/32 below already
+                # does the real 32-vs-64 disambiguation after split().
+                if (line ~ /^[0-9a-fA-F]+:[0-9*]+:/) {
                     split(line, a, ":")
                     h = tolower(a[1]); name = a[3]
                     if (length(h) == 64) print "SHA256\t" h "\t" name
@@ -1710,14 +1857,144 @@ EOF
         [ -s "$f" ] && bb awk '{print $1 "\t" ($2 ? $2 : "External.Hash")}' "$f" >> "$out_dir/sha256.tsv"
     done
 
-    # YARA: gather external rule sources (fetched during -u) plus our own
-    # generated NDB/LDB rules, and compile them ALL into one ruleset here —
-    # so every worker just loads a single pre-compiled rules.yarc instead
-    # of each re-parsing rule text from scratch (see MODULE: ClamAV format
-    # support above for why this matters at scale).
+    # Base64 -> SHA256 precompute
+    if [ -s "$out_dir/b64_payloads.tsv" ] && [ "$SHA256_CMD" != "none" ]; then
+        local tmp_b64="$out_dir/b64_compiled.tsv"
+        while IFS=$'\t' read -r payload name; do
+            [ -z "$payload" ] && continue
+            local dh
+            dh=$(printf '%s' "$payload" | ( [ "$OS" = "macos" ] && base64 -D || base64 -d ) 2>/dev/null | $SHA256_CMD 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1)
+            [ -n "$dh" ] && echo -e "${dh}\t${name:-Custom.B64}" >> "$tmp_b64"
+        done < "$out_dir/b64_payloads.tsv"
+        mv -f "$tmp_b64" "$out_dir/b64_payloads.tsv" 2>/dev/null || touch "$out_dir/b64_payloads.tsv"
+    fi
+
+    # Custom
+    local cdir=""
+    if [ -d "$sig_input/custom" ]; then cdir="$sig_input/custom"
+    elif [ -d "$SIG_DIR/custom" ]; then cdir="$SIG_DIR/custom"; fi
+    if [ -n "$cdir" ] && [ -d "$cdir" ]; then
+        bb find "$cdir" -name "*.md5" -exec cat {} + 2>/dev/null >> "$out_dir/md5.tsv" || true
+        bb find "$cdir" -name "*.sha256" -exec cat {} + 2>/dev/null >> "$out_dir/sha256.tsv" || true
+        bb find "$cdir" -name "*.strings" -exec cat {} + 2>/dev/null >> "$out_dir/strings.txt" || true
+        echo "  ✓ Custom signatures loaded"
+    fi
+
+    # Strip known-degenerate hashes: the empty-input MD5/SHA256 constant.
+    # A 0-byte file always hashes to the SAME value regardless of content —
+    # if any upstream/custom signature source ever contains that hash
+    # (whether by genuine upstream data or by our own parsing picking up
+    # a blank/malformed field somewhere), every empty file anywhere would
+    # match it. This filters both hashes out at the source, as defense in
+    # depth alongside the explicit 0-byte skip in the scan paths.
+    local empty_md5="d41d8cd98f00b204e9800998ecf8427e"
+    local empty_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    # NOTE: grep -v exits 1 (not an error) when it filters out EVERY line —
+    # a plain "&&" chain would then skip the mv and leave the bad entry in
+    # place, so the mv runs unconditionally after grep regardless of its
+    # exit code.
+    if [ -s "$out_dir/md5.tsv" ]; then
+        bb grep -v "^${empty_md5}" "$out_dir/md5.tsv" > "$out_dir/md5.tsv.tmp" 2>/dev/null
+        mv -f "$out_dir/md5.tsv.tmp" "$out_dir/md5.tsv" 2>/dev/null
+    fi
+    if [ -s "$out_dir/sha256.tsv" ]; then
+        bb grep -v "^${empty_sha256}" "$out_dir/sha256.tsv" > "$out_dir/sha256.tsv.tmp" 2>/dev/null
+        mv -f "$out_dir/sha256.tsv.tmp" "$out_dir/sha256.tsv" 2>/dev/null
+    fi
+
+    # Strip known-overbroad string patterns regardless of source (our own
+    # built-in list, custom.strings, OR an external database like maldet's
+    # own signature pack — confirmed in practice: "chmod 777" persisted
+    # after removing it from our own built-in list, meaning some other
+    # source was reintroducing it). "chmod 777" as bare text matches
+    # ordinary installation INSTRUCTIONS in docs/language files, not just
+    # malicious code — too weak a signal on its own from any source.
+    if [ -s "$out_dir/strings.txt" ]; then
+        bb grep -v -i "^chmod 777" "$out_dir/strings.txt" > "$out_dir/strings.txt.tmp" 2>/dev/null
+        mv -f "$out_dir/strings.txt.tmp" "$out_dir/strings.txt" 2>/dev/null
+    fi
+
+    # Dedup strings.txt BEFORE generating YARA rules from it (not after —
+    # that was a real bug: the general dedup pass used to run AFTER rule
+    # generation, so a pattern appearing twice — e.g. once from the
+    # built-in list and once from custom.strings — became TWO separate
+    # YARA rules, both matching the same file and double-counting every
+    # such hit in the threat total, even though the displayed list looked
+    # fine since it dedupes the STRING content, hiding the duplicate).
+    [ -s "$out_dir/strings.txt" ] && bb sort -u "$out_dir/strings.txt" -o "$out_dir/strings.txt" 2>/dev/null
+
+    # Move string-based text signatures into the SAME YARA pass used for
+    # NDB/LDB/external rules ("максимально задіяти YARA" — requested after
+    # confirming the per-file grep -a string search was still a full extra
+    # read of every file on top of the YARA pass, base64 scan, and hash
+    # computation). One rule per pattern (mirrors the NDB/LDB approach),
+    # with a companion name->pattern map so the worker can still report
+    # "SIG_STRING_MATCH pattern=..." instead of a raw YARA rule name.
+    #
+    # NOTE: this is deliberately NOT done for hash signatures (sha256.tsv/
+    # md5.tsv) — measured empirically: YARA's hash module evaluates one
+    # condition per rule with no literal-atom prefiltering to skip most of
+    # them, so a realistic 100k-entry hash database took ~58ms/file to
+    # check via YARA vs the current batched "grep -F against a flat file"
+    # approach (a few ms/file amortized across a whole batch) — YARA would
+    # make hash lookups SLOWER, not faster, at real ClamAV/Maldet database
+    # scale (hundreds of thousands of entries). String signatures don't
+    # have this problem since they're normal byte/text patterns that DO
+    # benefit from YARA's usual prefiltering.
     mkdir -p "$out_dir/yara"
-    if [ -d "$sig_input/yara" ]; then
-        bb find "$sig_input/yara" -not -path '*/.git/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | head -200 | while read -r yf; do
+    : > "$out_dir/yara/generated_strings.yar"
+    : > "$out_dir/str_sig_map.tsv"
+    if [ -s "$out_dir/strings.txt" ]; then
+        bb awk -v yarout="$out_dir/yara/generated_strings.yar" -v mapout="$out_dir/str_sig_map.tsv" '
+            function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+            {
+                line = $0
+                if (line == "" || line ~ /^#/) next
+                rname = "strsig_" NR "_" FILENAME
+                gsub(/[^a-zA-Z0-9_]/, "_", rname)
+                print "rule " rname " { strings: $a = \"" esc(line) "\" nocase ascii condition: $a }" >> yarout
+                print rname "\t" line >> mapout
+            }
+        ' "$out_dir/strings.txt"
+    fi
+
+    # Base64-payload SCREENING also folded into the same YARA pass — this
+    # was a separate `grep -oE` full-file read on EVERY scanned file
+    # before, regardless of whether it actually contained anything
+    # base64-looking (which most files don't). Reserved rule name
+    # "__av_b64_screen__": when it fires, the worker does the (much rarer)
+    # decode+magic-check+hash-lookup follow-up ONLY for that file, instead
+    # of scanning every file's content separately. Directly reduces total
+    # disk reads per scan, which matters most on I/O/IOPS-constrained
+    # hosts where reducing fork/process count alone stops helping once
+    # disk throughput, not CPU, is the ceiling.
+    cat << 'EOF' > "$out_dir/yara/generated_b64_screen.yar"
+rule __av_b64_screen__ {
+    strings:
+        $s = /[A-Za-z0-9+\/]{200,}={0,2}/
+    condition:
+        $s
+}
+EOF
+
+    # YARA: gather external rule sources (fetched during -u) plus our own
+    # generated NDB/LDB/string rules, and compile them ALL into one
+    # ruleset here — so every worker just loads a single pre-compiled
+    # rules.yarc instead of each re-parsing rule text from scratch (see
+    # MODULE: ClamAV format support above for why this matters at scale).
+    #
+    # FIX (real gap found on audit): this used to only look in
+    # "$sig_input/yara/" — but Maldet's own sigpack ships a real YARA file
+    # (rfxn.yara) inside "$sig_input/maldet/", which was never picked up
+    # here. Worse, since its extension didn't match hdb/ndb/ldb/mdb, it
+    # fell into the GENERIC line-based hash/pattern parser instead, which
+    # doesn't understand YARA syntax — so it was silently doing nothing
+    # useful with real rule definitions. Now searches ALL of $sig_input
+    # for *.yar/*.yara files (any subdirectory, not just yara/), and those
+    # files are excluded from sig_files/generic_files below so they're
+    # compiled as actual YARA rules, not misrouted as hash/pattern text.
+    if [ -d "$sig_input" ]; then
+        bb find "$sig_input" -not -path '*/.git/*' -not -path '*/.cache/*' \( -name "*.yar" -o -name "*.yara" \) 2>/dev/null | head -500 | while read -r yf; do
             cp "$yf" "$out_dir/yara/" 2>/dev/null || true
         done
     fi
@@ -1728,6 +2005,14 @@ EOF
     # defaults are fine: this scanner batches many files per yara call, so
     # there's no single "current filename" to give them anyway; rules that
     # depend on a real value just won't match on that condition.
+    #
+    # IMPORTANT: these -d declarations must be given IDENTICALLY at both
+    # yarac (here) and yara scan time (process_yara_batch et al) — tested
+    # empirically: compiling WITH -d but scanning WITHOUT (or vice versa)
+    # makes yara -C fail with "error: 29" on EVERY file, silently
+    # (--scan-list mode doesn't even print the error to a visible stream
+    # by default), which would otherwise look exactly like "just no
+    # matches" instead of "totally broken".
     local yara_extvars=(-d filename= -d filepath= -d extension=)
 
     local yar_sources
@@ -1770,29 +2055,6 @@ EOF
         done <<< "$yar_sources"
     fi
 
-    # Base64 -> SHA256 precompute
-    if [ -s "$out_dir/b64_payloads.tsv" ] && [ "$SHA256_CMD" != "none" ]; then
-        local tmp_b64="$out_dir/b64_compiled.tsv"
-        while IFS=$'\t' read -r payload name; do
-            [ -z "$payload" ] && continue
-            local dh
-            dh=$(printf '%s' "$payload" | ( [ "$OS" = "macos" ] && base64 -D || base64 -d ) 2>/dev/null | $SHA256_CMD 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1)
-            [ -n "$dh" ] && echo -e "${dh}\t${name:-Custom.B64}" >> "$tmp_b64"
-        done < "$out_dir/b64_payloads.tsv"
-        mv -f "$tmp_b64" "$out_dir/b64_payloads.tsv" 2>/dev/null || touch "$out_dir/b64_payloads.tsv"
-    fi
-
-    # Custom
-    local cdir=""
-    if [ -d "$sig_input/custom" ]; then cdir="$sig_input/custom"
-    elif [ -d "$SIG_DIR/custom" ]; then cdir="$SIG_DIR/custom"; fi
-    if [ -n "$cdir" ] && [ -d "$cdir" ]; then
-        bb find "$cdir" -name "*.md5" -exec cat {} + 2>/dev/null >> "$out_dir/md5.tsv" || true
-        bb find "$cdir" -name "*.sha256" -exec cat {} + 2>/dev/null >> "$out_dir/sha256.tsv" || true
-        bb find "$cdir" -name "*.strings" -exec cat {} + 2>/dev/null >> "$out_dir/strings.txt" || true
-        echo "  ✓ Custom signatures loaded"
-    fi
-
     # Dedup (also collapses now-common ".*"-only variants of what used to be
     # distinct bounded-quantifier patterns)
     for f in sha256.tsv md5.tsv strings.txt b64_payloads.tsv hex_ere.txt mdb.tsv; do
@@ -1817,9 +2079,11 @@ EOF
     # reuse them without recompiling (see comment at the top of this function)
     mkdir -p "$cache_dir"
     cp -f "$out_dir"/sha256.tsv "$out_dir"/md5.tsv "$out_dir"/hex_ere.txt \
-          "$out_dir"/strings.txt "$out_dir"/b64_payloads.tsv "$out_dir"/mdb.tsv "$cache_dir/" 2>/dev/null || true
+          "$out_dir"/strings.txt "$out_dir"/b64_payloads.tsv "$out_dir"/mdb.tsv \
+          "$out_dir"/str_sig_map.tsv "$cache_dir/" 2>/dev/null || true
     [ -d "$out_dir/yara" ] && cp -rf "$out_dir/yara" "$cache_dir/" 2>/dev/null
     touch "$compiled_flag" 2>/dev/null || true
+    printf '%s' "$VERSION" > "$version_flag" 2>/dev/null || true
 
     echo -e "  SHA256 : ${C}$(bb wc -l < "$out_dir/sha256.tsv" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  MD5    : ${C}$(bb wc -l < "$out_dir/md5.tsv" 2>/dev/null | tr -d ' ')${Z}"
@@ -1961,7 +2225,7 @@ launch_workers() {
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
             "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
             "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" &
+            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" &
         WORKER_PIDS+=($!)
     done
 }
@@ -2087,11 +2351,16 @@ build_report() {
     ELAPSED_S=$(( (END_MS - START_MS) / 1000 ))
     TF=0; TT=0; SC=0
     local r f t
+    local th_ms=0 ty_ms=0 tu_ms=0 tp_ms=0 v
     for r in "$WORK_DIR/reports"/pool_*.txt; do
         [ -f "$r" ] || continue
         f=$(bb grep "^FILES_SCANNED:" "$r" 2>/dev/null | cut -d: -f2)
         t=$(bb grep "^THREATS_FOUND:" "$r" 2>/dev/null | cut -d: -f2)
         TF=$(( TF + ${f:-0} )); TT=$(( TT + ${t:-0} ))
+        v=$(bb grep "^TIMING_HASH_MS:" "$r" 2>/dev/null | cut -d: -f2); th_ms=$(( th_ms + ${v:-0} ))
+        v=$(bb grep "^TIMING_YARA_MS:" "$r" 2>/dev/null | cut -d: -f2); ty_ms=$(( ty_ms + ${v:-0} ))
+        v=$(bb grep "^TIMING_HEUR_MS:" "$r" 2>/dev/null | cut -d: -f2); tu_ms=$(( tu_ms + ${v:-0} ))
+        v=$(bb grep "^TIMING_PE_MS:" "$r" 2>/dev/null | cut -d: -f2); tp_ms=$(( tp_ms + ${v:-0} ))
     done
     SC=$(count_suppressed)
     SPEED=0; [ "$ELAPSED_S" -gt 0 ] && SPEED=$(( TF / ELAPSED_S ))
@@ -2105,6 +2374,24 @@ build_report() {
     [ "${SC:-0}" -gt 0 ] 2>/dev/null && suppressed_line="
  Suppressed (ignore_sigs): $SC ($IGNORE_SIGS_FILE)"
 
+    # Diagnostic time breakdown: these 4 numbers are SUMMED ACROSS ALL
+    # WORKERS (so they can individually exceed wall-clock elapsed time when
+    # running with multiple workers in parallel — that's expected, compare
+    # them to each other and to elapsed*workers, not to elapsed alone).
+    # "unaccounted" is whatever's left: per-file base64/disguised/
+    # permission checks, file collection, process/fork overhead, and disk
+    # I/O wait not otherwise attributed. A large unaccounted share with all
+    # 4 named phases small points at I/O (or per-file base64 scan cost)
+    # rather than any single batch subsystem.
+    local total_batch_ms=$(( th_ms + ty_ms + tu_ms + tp_ms ))
+    local elapsed_ms=$(( ELAPSED_S * 1000 * (WORKERS > 0 ? WORKERS : 1) ))
+    local unaccounted_ms=$(( elapsed_ms - total_batch_ms ))
+    [ "$unaccounted_ms" -lt 0 ] && unaccounted_ms=0
+    local timing_line="
+ Time breakdown (ms, summed across ${WORKERS} worker(s)):
+   hash=${th_ms} yara=${ty_ms} strings/hex=${tu_ms} pe-sections=${tp_ms}
+   other/unaccounted=${unaccounted_ms} (per-file checks, I/O wait, overhead)"
+
     RPT="
 =================================================
  SCAN RESULTS  (Oprhus Unified v${VERSION})
@@ -2115,7 +2402,7 @@ build_report() {
  Threats Found      : $TT${quarantine_line}${suppressed_line}
  Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
  Avg Speed          : ${SPEED} files/s
- Workers            : $WORKERS
+ Workers            : $WORKERS${timing_line}
 ================================================="
 }
 
@@ -2181,7 +2468,7 @@ start_realtime_worker() {
         "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
         "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
         "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" &
+        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" &
     REALTIME_WORKER_PID=$!
 
     # Keep the write fd (3) open permanently — opening/closing per event
@@ -2279,6 +2566,7 @@ main() {
     init_toolchain
     YARA_CMD=$(detect_yara)
     detect_yarac
+    [ -x "$SCRIPT_DIR/bin/grep" ] && GREP_BIN="$SCRIPT_DIR/bin/grep"
 
     # --update is a standalone action (like typical AV tools separate
     # update from scan): update signatures, then exit, no auto-scan.
@@ -2366,9 +2654,9 @@ YARA_CMD="${11:-none}"
 QUARANTINE_DIR="${12:-}"      # empty = quarantine disabled
 QUARANTINE_PERM="${13:-0400}"
 BUSYBOX_BIN="${14:-}"         # inherited from the main script (same binary)
-BATCH_SIZE="${15:-50}"        # files per hash/YARA batch
-HEUR_BATCH_SIZE="${16:-50}"   # files per strings/hex heuristic batch
-PE_BATCH_SIZE="${17:-50}"     # files per PE-section (.mdb) batch
+BATCH_SIZE="${15:-200}"       # files per hash/YARA batch
+HEUR_BATCH_SIZE="${16:-200}"  # files per strings/hex heuristic batch
+PE_BATCH_SIZE="${17:-100}"    # files per PE-section (.mdb) batch
 LIVE_REPORT_FILE="${18:-}"    # persistent live threat log (outside the
                                # ephemeral WORK_DIR) — written to immediately
                                # as each threat is found, see threat() below
@@ -2381,12 +2669,41 @@ ARCHIVE_MAX_EXTRACT_MB="${22:-500}"
 ARCHIVE_MAX_DEPTH="${23:-2}"
 ARCHIVE_MAX_FILES="${24:-2000}"
 ARCHIVE_DEPTH_CUR=0            # current recursion depth, tracked at runtime
+USE_RAM="${25:-true}"          # prefer /dev/shm for archive extraction too
+GREP_BIN="${26:-}"             # bundled static grep — see MODULE below
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
 FILES_SCANNED=0
 THREATS_FOUND=0
 SUPPRESSED_FOUND=0
+# Coarse per-phase timing (ms), accumulated across all batches this worker
+# processes — reported at the end so a slow scan can be diagnosed (CPU/fork
+# overhead vs disk I/O vs a specific subsystem) instead of guessed at.
+T_HASH_MS=0
+T_YARA_MS=0
+T_HEUR_MS=0
+T_PE_MS=0
+T_CHECK_MS=0
+_now_ms() {
+    date +%s%3N 2>/dev/null || echo $(( $(date +%s) * 1000 ))
+}
+# "Real" (non-busybox) grep, for the specific searches that need correct
+# binary-safe (-a) handling — busybox's grep confirmed to silently miss
+# matches in NUL-containing files even with -a. Prefers the bundled static
+# build (see --setup / build_grep_from_source), falls back to whatever
+# system grep is on PATH, since either is a real GNU/POSIX grep unlike
+# busybox's minimal reimplementation.
+_real_grep() {
+    if [ -n "$GREP_BIN" ] && [ -x "$GREP_BIN" ]; then
+        "$GREP_BIN" "$@"
+    else
+        command grep "$@"
+    fi
+}
+_has_real_grep() {
+    { [ -n "$GREP_BIN" ] && [ -x "$GREP_BIN" ]; } || command -v grep &>/dev/null
+}
 MAX_SIZE=$(( MAX_SCAN_MB * 1024 * 1024 ))
 
 HAS_SHA256=false
@@ -2396,6 +2713,7 @@ HAS_STRINGS=false
 HAS_HEX_ERE=false
 HAS_YARA=false
 HAS_MDB=false
+HAS_STR_SIG_MAP=false
 YARA_HAS_SCAN_LIST=false
 YARA_TARGET=""
 BB_APPLETS=""
@@ -2446,6 +2764,7 @@ init_worker_state() {
     [ -s "$SIG_DIR/strings.txt" ] && HAS_STRINGS=true
     [ -s "$SIG_DIR/hex_ere.txt" ] && HAS_HEX_ERE=true
     [ -s "$SIG_DIR/mdb.tsv" ] && HAS_MDB=true
+    [ -s "$SIG_DIR/str_sig_map.tsv" ] && HAS_STR_SIG_MAP=true
 
     if [ -f "$SIG_DIR/yara/rules.yarc" ]; then
         HAS_YARA=true; YARA_TARGET="$SIG_DIR/yara/rules.yarc"
@@ -2460,11 +2779,40 @@ init_worker_state() {
     if [ "$HAS_YARA" = true ] && "$YARA_CMD" --help 2>&1 | bb grep -q -- "--scan-list"; then
         YARA_HAS_SCAN_LIST=true
     fi
+
+    # String signatures are folded into the YARA ruleset (one rule per
+    # pattern, see compile_signatures) whenever both YARA and the
+    # name->pattern map are available — that covers the string search in
+    # the SAME pass as YARA_MATCH, instead of a separate grep -a read of
+    # every file. Only fall back to the standalone grep -a pass in
+    # process_heuristic_batch when YARA isn't usable.
+    if [ "$HAS_YARA" = true ] && [ "$HAS_STR_SIG_MAP" = true ]; then
+        HAS_STRINGS=false
+    fi
 }
 
 # ----------------------------------------------------------------------------
 # MODULE: low-level helpers (stat / hash / decode / strings / file-type)
 # ----------------------------------------------------------------------------
+# Translates a "strsig_*" YARA rule name (generated in compile_signatures
+# from strings.txt) back into the original pattern text, so results still
+# read as "SIG_STRING_MATCH pattern=..." instead of a raw internal rule
+# name. Returns empty if the rule isn't a string-signature rule (i.e. a
+# real YARA rule from NDB/LDB or an external ruleset).
+_resolve_str_sig() {
+    local rule="$1"
+    [ "$HAS_STR_SIG_MAP" = true ] || return 1
+    case "$rule" in
+        strsig_*) ;;
+        *) return 1 ;;
+    esac
+    local pat
+    pat=$(bb grep -m1 "^${rule}"$'\t' "$SIG_DIR/str_sig_map.tsv" 2>/dev/null | cut -f2-)
+    [ -z "$pat" ] && return 1
+    echo "$pat"
+    return 0
+}
+
 _stat_size() {
     if [ "$OS" = "macos" ]; then bb stat -f '%z' "$1" 2>/dev/null
     else bb stat -c '%s' "$1" 2>/dev/null; fi
@@ -2540,6 +2888,37 @@ _pe_section_table() {
         ptr=$(_hex_le32 "$hexdump" $((off+20)))
         [ "$rawsize" -gt 0 ] 2>/dev/null && printf '%s\t%s\n' "$ptr" "$rawsize"
     done
+}
+
+# Timed wrappers around each batch-processing function — accumulate coarse
+# per-phase timing (T_*_MS) so a slow scan can be diagnosed by WHERE time
+# actually goes (reported in the final summary) instead of guessed at.
+# Deliberately NOT applied to per-file calls (check_file_heuristics) — the
+# timing itself forks `date`, and doing that thousands of times would add
+# real overhead to exactly what we're trying to measure.
+_timed_hash_batch() {
+    local _t0; _t0=$(_now_ms)
+    process_hash_batch "$@"
+    local _t1; _t1=$(_now_ms)
+    T_HASH_MS=$(( T_HASH_MS + _t1 - _t0 ))
+}
+_timed_yara_batch() {
+    local _t0; _t0=$(_now_ms)
+    process_yara_batch "$@"
+    local _t1; _t1=$(_now_ms)
+    T_YARA_MS=$(( T_YARA_MS + _t1 - _t0 ))
+}
+_timed_heur_batch() {
+    local _t0; _t0=$(_now_ms)
+    process_heuristic_batch "$@"
+    local _t1; _t1=$(_now_ms)
+    T_HEUR_MS=$(( T_HEUR_MS + _t1 - _t0 ))
+}
+_timed_pe_batch() {
+    local _t0; _t0=$(_now_ms)
+    process_pe_batch "$@"
+    local _t1; _t1=$(_now_ms)
+    T_PE_MS=$(( T_PE_MS + _t1 - _t0 ))
 }
 
 # Batched (size, md5) lookup for a set of candidate PE files' sections
@@ -2656,10 +3035,28 @@ _verify_package_file() {
 }
 
 _bash_file_type() {
-    local magic
-    magic=$(bb dd if="$1" bs=8 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n')
-    [ -z "$magic" ] && { echo "EMPTY"; return; }
-    case "$magic" in
+    # PERFORMANCE: this is called on essentially every scanned file (YARA
+    # skip_deep decision). The old dd+od pipeline forks 2 external
+    # processes per call — on millions of files that overhead adds up
+    # fast, especially on weaker/shared-CPU hosts. Read the first 8 bytes
+    # via bash's own `read` builtin and convert to hex in pure bash — zero
+    # forks. Falls back to the dd+od path if the pure-bash read comes up
+    # empty for any reason (e.g. exotic filesystem edge cases), so this
+    # can't silently lose detection coverage.
+    local bytes="" hex="" i c ord
+    { IFS= read -r -d '' -n 8 bytes < "$1"; } 2>/dev/null
+    if [ -n "$bytes" ]; then
+        for (( i=0; i<${#bytes}; i++ )); do
+            c="${bytes:$i:1}"
+            printf -v ord '%02x' "'$c"
+            hex+="$ord"
+        done
+    fi
+    if [ -z "$hex" ]; then
+        hex=$(bb dd if="$1" bs=8 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n')
+    fi
+    [ -z "$hex" ] && { echo "EMPTY"; return; }
+    case "$hex" in
         7f454c46*) echo "ELF" ;;
         4d5a*)     echo "PE_MZ" ;;
         25504446*) echo "PDF" ;;
@@ -2713,13 +3110,23 @@ _archive_type() {
 
 _archive_extract() {
     local archive="$1" atype="$2" extract_dir="$3"
+    # FIX: `timeout CMD` execs CMD as a real process — it cannot see shell
+    # FUNCTIONS like bb(), so "timeout 30 bb unzip ..." failed with "bb:
+    # command not found" (exit 127) every time, silently (stderr
+    # discarded), extracting nothing. Resolve the real command (busybox
+    # binary + applet, or the system tool) into a plain string BEFORE
+    # handing it to timeout, same lookup bb() does internally.
+    local unzip_c="unzip" tar_c="tar" gunzip_c="gunzip"
+    case "$BB_APPLETS" in *" unzip "*)  unzip_c="$BUSYBOX_BIN unzip" ;; esac
+    case "$BB_APPLETS" in *" tar "*)    tar_c="$BUSYBOX_BIN tar" ;; esac
+    case "$BB_APPLETS" in *" gunzip "*) gunzip_c="$BUSYBOX_BIN gunzip" ;; esac
     case "$atype" in
-        zip)    timeout 30 bb unzip -qq -o "$archive" -d "$extract_dir" 2>/dev/null ;;
-        tar)    timeout 30 bb tar -xf "$archive" -C "$extract_dir" 2>/dev/null ;;
-        targz)  timeout 30 bb tar -xzf "$archive" -C "$extract_dir" 2>/dev/null ;;
-        tarbz2) timeout 30 bb tar -xjf "$archive" -C "$extract_dir" 2>/dev/null ;;
-        tarxz)  timeout 30 bb tar -xJf "$archive" -C "$extract_dir" 2>/dev/null ;;
-        gz)     timeout 30 bb gunzip -c "$archive" > "$extract_dir/$(basename "${archive%.gz}")" 2>/dev/null ;;
+        zip)    timeout 30 $unzip_c -qq -o "$archive" -d "$extract_dir" 2>/dev/null ;;
+        tar)    timeout 30 $tar_c -xf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        targz)  timeout 30 $tar_c -xzf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        tarbz2) timeout 30 $tar_c -xjf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        tarxz)  timeout 30 $tar_c -xJf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        gz)     timeout 30 $gunzip_c -c "$archive" > "$extract_dir/$(basename "${archive%.gz}")" 2>/dev/null ;;
         bz2)    timeout 30 bunzip2 -c "$archive" > "$extract_dir/$(basename "${archive%.bz2}")" 2>/dev/null ;;
         xz)     timeout 30 unxz -c "$archive" > "$extract_dir/$(basename "${archive%.xz}")" 2>/dev/null ;;
         7z)     timeout 30 7z x -y -o"$extract_dir" "$archive" &>/dev/null ;;
@@ -2738,52 +3145,111 @@ _archive_extract() {
 # Not batched (archives are opt-in / lower volume than the main file
 # stream), so this does direct per-file checks rather than queueing into
 # the shared BATCH_* arrays.
-_scan_archive_member() {
-    local archive="$1" member_path="$2" rel="$3"
-    local msize
-    msize=$(_stat_size "$member_path" 2>/dev/null) || return
-    [ "${msize:-0}" -gt "$MAX_SIZE" ] && return
+_archive_tmpdir() {
+    # Extract into RAM (/dev/shm) when there's room, same reasoning as the
+    # main WORK_DIR: much less I/O-bound than disk, which matters most on
+    # exactly the kind of low-end VPS where every bit of speed counts.
+    # Respects --no-ram (USE_RAM=false) and falls back to disk if /dev/shm
+    # doesn't have enough free space for the configured extraction cap.
+    if [ "$USE_RAM" = "true" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+        local avail
+        avail=$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
+        if [ "${avail:-0}" -ge "$ARCHIVE_MAX_EXTRACT_MB" ]; then
+            mktemp -d /dev/shm/av_arch_XXXXXX 2>/dev/null && return
+        fi
+    fi
+    mktemp -d 2>/dev/null
+}
 
-    if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
-        local h
-        h=$($SHA256_CMD "$member_path" 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
-        if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/sha256.tsv" 2>/dev/null; then
-            local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/sha256.tsv" | cut -f2)
-            threat "KNOWN_MALWARE" "$archive" "archive_member=${rel}|name=${n:-Malware}|sha256=$h"
-            return
+# Batched hash check across ALL members of one archive at once — computing
+# each member's hash is inherently per-file (unavoidable), but the lookup
+# itself uses the same fast grep -qF path the main scan uses.
+_archive_batch_hash_check() {
+    local top_archive="$1" extract_dir="$2" cur_rel="$3"; shift 3
+    local m msize rel
+    for m in "$@"; do
+        msize=$(_stat_size "$m" 2>/dev/null) || continue
+        { [ "${msize:-0}" -eq 0 ] || [ "${msize:-0}" -gt "$MAX_SIZE" ]; } && continue
+        rel="${m#$extract_dir/}"
+        [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+
+        if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
+            local h
+            h=$($SHA256_CMD "$m" 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
+            if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/sha256.tsv" 2>/dev/null; then
+                local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/sha256.tsv" | cut -f2)
+                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|sha256=$h"
+                continue
+            fi
         fi
-    fi
-    if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
-        local h
-        h=$($MD5_CMD "$member_path" 2>/dev/null | bb grep -oE '[0-9a-f]{32}' | head -1)
-        if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/md5.tsv" 2>/dev/null; then
-            local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/md5.tsv" | cut -f2)
-            threat "KNOWN_MALWARE" "$archive" "archive_member=${rel}|name=${n:-Malware}|md5=$h"
-            return
+        if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
+            local h
+            h=$($MD5_CMD "$m" 2>/dev/null | bb grep -oE '[0-9a-f]{32}' | head -1)
+            if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/md5.tsv" 2>/dev/null; then
+                local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/md5.tsv" | cut -f2)
+                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|md5=$h"
+            fi
         fi
-    fi
-    if [ "$HAS_YARA" = true ]; then
-        local yflags=(-d filename= -d filepath= -d extension=) yhit
-        case "$YARA_TARGET" in *.yarc) yflags+=(-C) ;; esac
-        yhit=$($YARA_CMD "${yflags[@]}" "$YARA_TARGET" "$member_path" 2>/dev/null | head -1 | awk '{print $1}')
-        [ -n "$yhit" ] && { threat "YARA_MATCH" "$archive" "archive_member=${rel}|rule=$yhit"; return; }
-    fi
-    if [ "$HAS_STRINGS" = true ]; then
-        local sm
-        sm=$(do_strings "$member_path" 6 524288 | bb grep -F -i -f "$SIG_DIR/strings.txt" 2>/dev/null | head -1)
-        [ -n "$sm" ] && threat "SIG_STRING_MATCH" "$archive" "archive_member=${rel}|pattern=${sm:0:50}"
+    done
+}
+
+# Batched YARA check across ALL members of one archive in ONE call. This is
+# the fix for the real slowdown reported: the old per-member design called
+# $YARA_CMD separately for EVERY file inside the archive, reloading/
+# compiling the whole ruleset each time — on an archive with dozens of
+# members that alone made a single zip take minutes. Same --scan-list (or
+# symlink+-r fallback) technique already used for the main file batches.
+_archive_batch_yara_check() {
+    local top_archive="$1" extract_dir="$2" cur_rel="$3"; shift 3
+    [ $# -eq 0 ] && return
+
+    local yflags=(-d filename= -d filepath= -d extension=)
+    case "$YARA_TARGET" in *.yarc) yflags+=(-C) ;; esac
+
+    local yara_out
+    if [ "$YARA_HAS_SCAN_LIST" = true ]; then
+        local listfile
+        listfile=$(mktemp 2>/dev/null) || return
+        printf '%s\n' "$@" > "$listfile"
+        yara_out=$($YARA_CMD "${yflags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        rm -f "$listfile"
+    else
+        local tmpdir2
+        tmpdir2=$(mktemp -d 2>/dev/null) || return
+        local f
+        for f in "$@"; do
+            ln -sf "$f" "$tmpdir2/$(basename "$f")_$RANDOM" 2>/dev/null
+        done
+        local raw
+        raw=$($YARA_CMD "${yflags[@]}" -r "$YARA_TARGET" "$tmpdir2" 2>/dev/null)
+        if [ -n "$raw" ]; then
+            yara_out=$(while IFS= read -r l; do
+                [ -z "$l" ] && continue
+                local r p real
+                r=$(echo "$l" | awk '{print $1}')
+                p=$(echo "$l" | cut -d' ' -f2-)
+                real=$(readlink -f "$p" 2>/dev/null || echo "$p")
+                echo "$r $real"
+            done <<< "$raw")
+        fi
+        rm -rf "$tmpdir2"
     fi
 
-    # Nested archive? Recurse up to the configured depth limit.
-    if [ "$ARCHIVE_DEPTH_CUR" -lt "$ARCHIVE_MAX_DEPTH" ]; then
-        local atype2
-        atype2=$(_archive_type "$member_path")
-        if [ -n "$atype2" ]; then
-            ARCHIVE_DEPTH_CUR=$(( ARCHIVE_DEPTH_CUR + 1 ))
-            scan_archive "$archive" "$member_path" "$rel"
-            ARCHIVE_DEPTH_CUR=$(( ARCHIVE_DEPTH_CUR - 1 ))
+    [ -z "$yara_out" ] && return
+    local yline yrule yfile rel spat
+    while IFS= read -r yline; do
+        [ -z "$yline" ] && continue
+        yrule=$(echo "$yline" | awk '{print $1}')
+        [ "$yrule" = "__av_b64_screen__" ] && continue
+        yfile=$(echo "$yline" | cut -d' ' -f2-)
+        rel="${yfile#$extract_dir/}"
+        [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+        if spat=$(_resolve_str_sig "$yrule"); then
+            threat "SIG_STRING_MATCH" "$top_archive" "archive_member=${rel}|pattern=${spat:0:50}"
+        else
+            threat "YARA_MATCH" "$top_archive" "archive_member=${rel}|rule=$yrule"
         fi
-    fi
+    done <<< "$yara_out"
 }
 
 # scan_archive TOP_ARCHIVE [CURRENT_FILE] [CURRENT_REL]
@@ -2803,7 +3269,7 @@ scan_archive() {
     [ -z "$atype" ] && return
 
     local extract_dir
-    extract_dir=$(mktemp -d 2>/dev/null) || return
+    extract_dir=$(_archive_tmpdir) || return
 
     _archive_extract "$cur" "$atype" "$extract_dir"
 
@@ -2813,14 +3279,44 @@ scan_archive() {
         log "Archive extraction exceeded ${ARCHIVE_MAX_EXTRACT_MB}MB cap, scan may be incomplete: $top_archive"
     fi
 
-    local inner rel n=0
+    local -a members=()
+    local inner n=0
     while IFS= read -r -d '' inner; do
         n=$(( n + 1 ))
         [ "$n" -gt "$ARCHIVE_MAX_FILES" ] && break
-        rel="${inner#$extract_dir/}"
-        [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
-        _scan_archive_member "$top_archive" "$inner" "$rel"
+        members+=("$inner")
     done < <(find "$extract_dir" -type f -print0 2>/dev/null)
+
+    if [ ${#members[@]} -gt 0 ]; then
+        _archive_batch_hash_check "$top_archive" "$extract_dir" "$cur_rel" "${members[@]}"
+        [ "$HAS_YARA" = true ] && _archive_batch_yara_check "$top_archive" "$extract_dir" "$cur_rel" "${members[@]}"
+
+        # Strings + nested-archive recursion stay per-member: grep -F is
+        # cheap enough not to need batching, and nested archives are rare.
+        local m rel msize
+        for m in "${members[@]}"; do
+            msize=$(_stat_size "$m" 2>/dev/null) || continue
+            { [ "${msize:-0}" -eq 0 ] || [ "${msize:-0}" -gt "$MAX_SIZE" ]; } && continue
+            rel="${m#$extract_dir/}"
+            [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+
+            if [ "$HAS_STRINGS" = true ]; then
+                local sm
+                sm=$(do_strings "$m" 6 524288 | bb grep -F -i -f "$SIG_DIR/strings.txt" 2>/dev/null | head -1)
+                [ -n "$sm" ] && threat "SIG_STRING_MATCH" "$top_archive" "archive_member=${rel}|pattern=${sm:0:50}"
+            fi
+
+            if [ "$ARCHIVE_DEPTH_CUR" -lt "$ARCHIVE_MAX_DEPTH" ]; then
+                local atype2
+                atype2=$(_archive_type "$m")
+                if [ -n "$atype2" ]; then
+                    ARCHIVE_DEPTH_CUR=$(( ARCHIVE_DEPTH_CUR + 1 ))
+                    scan_archive "$top_archive" "$m" "$rel"
+                    ARCHIVE_DEPTH_CUR=$(( ARCHIVE_DEPTH_CUR - 1 ))
+                fi
+            fi
+        done
+    fi
 
     rm -rf "$extract_dir"
 }
@@ -3009,11 +3505,27 @@ process_yara_batch() {
     fi
 
     if [ -n "$yara_out" ]; then
+        local -A b64_screened=()
         while IFS= read -r yline; do
             [ -z "$yline" ] && continue
             local yrule; yrule=$(echo "$yline" | awk '{print $1}')
             local yfile; yfile=$(echo "$yline" | cut -d' ' -f2-)
-            threat "YARA_MATCH" "$yfile" "rule=$yrule"
+            if [ "$yrule" = "__av_b64_screen__" ]; then
+                # Not a threat by itself — just means "this file has a
+                # long base64-looking string somewhere". Do the (rarer)
+                # decode+check follow-up for THIS file only, once, instead
+                # of every file getting its own separate grep read.
+                [ -n "${b64_screened[$yfile]:-}" ] && continue
+                b64_screened[$yfile]=1
+                _check_b64_payload "$yfile"
+                continue
+            fi
+            local spat
+            if spat=$(_resolve_str_sig "$yrule"); then
+                threat "SIG_STRING_MATCH" "$yfile" "pattern=${spat:0:50}"
+            else
+                threat "YARA_MATCH" "$yfile" "rule=$yrule"
+            fi
         done <<< "$yara_out"
     fi
 }
@@ -3032,114 +3544,147 @@ process_heuristic_batch() {
     [ $# -eq 0 ] && return
     { [ "$HAS_STRINGS" = true ] || [ "$HAS_HEX_ERE" = true ]; } || return
 
-    local tmpdir
-    tmpdir=$(mktemp -d 2>/dev/null) || return
-
-    local -a idx_to_file=()
-    local -a flagged=()
-    local i=0 f
-    for f in "$@"; do
-        idx_to_file[$i]="$f"
-        flagged[$i]=0
-        [ "$HAS_STRINGS" = true ] && do_strings "$f" 6 524288 > "$tmpdir/${i}.str" 2>/dev/null
-        [ "$HAS_HEX_ERE" = true ] && bb dd if="$f" bs=524288 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n' > "$tmpdir/${i}.hex" 2>/dev/null
-        i=$((i + 1))
-    done
-
+    # PERFORMANCE FIX: this used to fork dd+strings (do_strings) for EVERY
+    # file before the batched search even ran — batching only combined the
+    # SEARCH step, not this per-file preparation step, so it never actually
+    # eliminated the dominant cost (~2 forks/file, e.g. ~5000 forks for
+    # 2485 files). strings.txt patterns are literal readable text, which
+    # already appears as a substring in a file's raw bytes whether the
+    # file is genuine text or binary — no separate "extract printable
+    # runs" step is actually needed. GNU grep -a searches binary files as
+    # text directly, AND (unlike yara) accepts many files as plain
+    # arguments in one call, so the whole batch can be searched with zero
+    # per-file preparation forks.
+    #
+    # CAVEAT: busybox's grep does NOT handle -a / binary content
+    # correctly (verified: silently finds nothing in files containing NUL
+    # bytes, matched or not) — this path requires real GNU grep. Falls
+    # back to the slower do_strings-based per-file extraction (the
+    # previous behavior) if system grep isn't available.
     if [ "$HAS_STRINGS" = true ]; then
-        local mf mi orig pat
-        while IFS= read -r mf; do
-            [ -z "$mf" ] && continue
-            mi="${mf##*/}"; mi="${mi%.str}"
-            orig="${idx_to_file[$mi]:-}"
-            [ -z "$orig" ] && continue
-            flagged[$mi]=1
-            pat=$(bb grep -F -i -o -f "$SIG_DIR/strings.txt" "$mf" 2>/dev/null | head -1)
-            threat "SIG_STRING_MATCH" "$orig" "pattern=${pat:0:50}"
-        done < <(bb grep -F -i -l -f "$SIG_DIR/strings.txt" "$tmpdir"/*.str 2>/dev/null)
+        if _has_real_grep; then
+            local mf pat
+            while IFS= read -r mf; do
+                [ -z "$mf" ] && continue
+                pat=$(_real_grep -F -a -i -o -f "$SIG_DIR/strings.txt" "$mf" 2>/dev/null | head -1)
+                threat "SIG_STRING_MATCH" "$mf" "pattern=${pat:0:50}"
+            done < <(_real_grep -F -a -i -l -f "$SIG_DIR/strings.txt" "$@" 2>/dev/null)
+        else
+            local tmpdir_s f i=0
+            tmpdir_s=$(mktemp -d 2>/dev/null) && {
+                local -a idx_s=()
+                for f in "$@"; do
+                    idx_s[$i]="$f"
+                    do_strings "$f" 6 524288 > "$tmpdir_s/${i}.str" 2>/dev/null
+                    i=$((i + 1))
+                done
+                local mf mi orig pat
+                while IFS= read -r mf; do
+                    [ -z "$mf" ] && continue
+                    mi="${mf##*/}"; mi="${mi%.str}"
+                    orig="${idx_s[$mi]:-}"
+                    [ -z "$orig" ] && continue
+                    pat=$(bb grep -F -i -o -f "$SIG_DIR/strings.txt" "$mf" 2>/dev/null | head -1)
+                    threat "SIG_STRING_MATCH" "$orig" "pattern=${pat:0:50}"
+                done < <(bb grep -F -i -l -f "$SIG_DIR/strings.txt" "$tmpdir_s"/*.str 2>/dev/null)
+                rm -rf "$tmpdir_s"
+            }
+        fi
     fi
 
+    # hex_ere.txt patterns are hex-DIGIT TEXT meant to match a hex-encoded
+    # dump of the file's bytes, not the raw bytes themselves — this still
+    # needs the per-file hex-dump preparation (can't skip it the way
+    # strings could). In practice HAS_HEX_ERE is false for most setups
+    # now that .ndb/.ldb signatures compile to YARA instead (see MODULE:
+    # ClamAV format support), so this path is rarely exercised.
     if [ "$HAS_HEX_ERE" = true ]; then
-        local mf mi orig hx
-        while IFS= read -r mf; do
-            [ -z "$mf" ] && continue
-            mi="${mf##*/}"; mi="${mi%.hex}"
-            [ "${flagged[$mi]:-0}" = "1" ] && continue
-            orig="${idx_to_file[$mi]:-}"
-            [ -z "$orig" ] && continue
-            hx=$(bb grep -E -o -i -f "$SIG_DIR/hex_ere.txt" "$mf" 2>/dev/null | head -1)
-            [ -n "$hx" ] && threat "HEX_SIG_MATCH" "$orig" "hex=${hx:0:40}..."
-        done < <(bb grep -E -l -i -f "$SIG_DIR/hex_ere.txt" "$tmpdir"/*.hex 2>/dev/null)
+        local tmpdir_h f i=0
+        tmpdir_h=$(mktemp -d 2>/dev/null) && {
+            local -a idx_h=()
+            for f in "$@"; do
+                idx_h[$i]="$f"
+                bb dd if="$f" bs=524288 count=1 2>/dev/null | bb od -An -tx1 -v | tr -d ' \n' > "$tmpdir_h/${i}.hex" 2>/dev/null
+                i=$((i + 1))
+            done
+            local mf mi orig hx
+            while IFS= read -r mf; do
+                [ -z "$mf" ] && continue
+                mi="${mf##*/}"; mi="${mi%.hex}"
+                orig="${idx_h[$mi]:-}"
+                [ -z "$orig" ] && continue
+                hx=$(bb grep -E -o -i -f "$SIG_DIR/hex_ere.txt" "$mf" 2>/dev/null | head -1)
+                [ -n "$hx" ] && threat "HEX_SIG_MATCH" "$orig" "hex=${hx:0:40}..."
+            done < <(bb grep -E -l -i -f "$SIG_DIR/hex_ere.txt" "$tmpdir_h"/*.hex 2>/dev/null)
+            rm -rf "$tmpdir_h"
+        }
     fi
+}
 
-    rm -rf "$tmpdir"
+# Decodes and checks candidate base64 chunks in ONE file: hash-lookup
+# against known payloads, then (if still unmatched) a follow-up YARA scan
+# of the DECODED content for anything ELF/PE/script-shaped. Extracted out
+# of check_file_heuristics so it can be called SELECTIVELY — only for
+# files that the YARA screening rule (__av_b64_screen__, see
+# compile_signatures) already flagged as containing a long base64-looking
+# string — instead of every scanned file getting its own separate
+# grep -oE read. On an IOPS-capped host this is the whole point: it's not
+# about CPU or fork count, it's about not opening/reading each file an
+# extra time for a check that, for most files, finds nothing at all.
+_check_b64_payload() {
+    local file="$1"
+    while IFS= read -r chunk; do
+        [ -z "$chunk" ] && continue
+        local b64tmp
+        b64tmp=$(mktemp 2>/dev/null) || continue
+        printf '%s' "$chunk" | _b64decode > "$b64tmp" 2>/dev/null
+        [ -s "$b64tmp" ] || { rm -f "$b64tmp"; continue; }
+
+        local magic
+        magic=$(bb od -An -tx1 -v "$b64tmp" 2>/dev/null | head -1 | tr -d ' \n')
+        case "$magic" in
+            7f454c46*|4d5a*|2321*) : ;;
+            *) rm -f "$b64tmp"; continue ;;
+        esac
+
+        if [ "$HAS_B64" = true ] && [ "$SHA256_CMD" != "none" ]; then
+            local dh
+            dh=$($SHA256_CMD "$b64tmp" 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
+            if [ -n "$dh" ] && bb grep -qF "$dh" "$SIG_DIR/b64_payloads.tsv" 2>/dev/null; then
+                local bname
+                bname=$(bb grep -m 1 "^$dh" "$SIG_DIR/b64_payloads.tsv" | cut -f2)
+                threat "KNOWN_B64_PAYLOAD" "$file" "name=${bname:-B64.Malware}|b64=${chunk:0:20}..."
+                rm -f "$b64tmp"
+                continue
+            fi
+        fi
+
+        local dtype="SCRIPT"
+        case "$magic" in 7f454c46*) dtype="ELF" ;; 4d5a*) dtype="PE_MZ" ;; esac
+        if [ "$HAS_YARA" = true ]; then
+            local yara_flags3=(-d filename= -d filepath= -d extension=) yhit
+            case "$YARA_TARGET" in *.yarc) yara_flags3+=(-C) ;; esac
+            yhit=$($YARA_CMD "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
+            [ -n "$yhit" ] && threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|yara=${yhit}|b64=${chunk:0:20}..."
+        else
+            threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|b64=${chunk:0:20}..."
+        fi
+        rm -f "$b64tmp"
+    done < <(if _has_real_grep; then _real_grep -oE '[A-Za-z0-9+/]{200,}={0,2}' "$file" 2>/dev/null; else bb grep -oE '[A-Za-z0-9+/]{200,}={0,2}' "$file" 2>/dev/null; fi | head -8)
 }
 
 check_file_heuristics() {
     local file="$1" size="$2" oct="$3"
 
     if [ "$size" -lt "$MAX_SIZE" ]; then
-        # Base64 payloads. PERFORMANCE FIX: real-world PHP/JS codebases are
-        # full of LEGITIMATE 40+ char base64-looking substrings (inline
-        # images, fonts, JWT tokens, minified data) — the old order did
-        # mktemp+decode+sha256sum+grep (4 forks) for EVERY match BEFORE even
-        # checking if it looked executable, which dominated per-file cost
-        # on such codebases. Now: check magic bytes FIRST (cheap, 1 read,
-        # no extra fork beyond the decode itself) and skip immediately for
-        # anything that isn't ELF/PE/script-shaped — the expensive
-        # hash-lookup and YARA checks only run on the small subset that
-        # actually looks like an embedded executable. Also raised the
-        # minimum match length (40->200 chars: a functional embedded
-        # ELF/PE header needs real size, so short matches are almost always
-        # incidental, not real payloads) and lowered the match cap (20->8)
-        # to cut down on candidates entirely.
-        while IFS= read -r chunk; do
-            [ -z "$chunk" ] && continue
-            local b64tmp
-            b64tmp=$(mktemp 2>/dev/null) || continue
-            printf '%s' "$chunk" | _b64decode > "$b64tmp" 2>/dev/null
-            [ -s "$b64tmp" ] || { rm -f "$b64tmp"; continue; }
-
-            local magic
-            magic=$(bb od -An -tx1 -v "$b64tmp" 2>/dev/null | head -1 | tr -d ' \n')
-            case "$magic" in
-                7f454c46*|4d5a*|2321*)
-                    : # falls through to the checks below
-                    ;;
-                *)
-                    rm -f "$b64tmp"
-                    continue
-                    ;;
-            esac
-
-            if [ "$HAS_B64" = true ] && [ "$SHA256_CMD" != "none" ]; then
-                local dh
-                dh=$($SHA256_CMD "$b64tmp" 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
-                if [ -n "$dh" ] && bb grep -qF "$dh" "$SIG_DIR/b64_payloads.tsv" 2>/dev/null; then
-                    local bname
-                    bname=$(bb grep -m 1 "^$dh" "$SIG_DIR/b64_payloads.tsv" | cut -f2)
-                    threat "KNOWN_B64_PAYLOAD" "$file" "name=${bname:-B64.Malware}|b64=${chunk:0:20}..."
-                    rm -f "$b64tmp"
-                    continue
-                fi
-            fi
-
-            local dtype="SCRIPT"
-            case "$magic" in 7f454c46*) dtype="ELF" ;; 4d5a*) dtype="PE_MZ" ;; esac
-            if [ "$HAS_YARA" = true ]; then
-                local yara_flags3=(-d filename= -d filepath= -d extension=) yhit
-                case "$YARA_TARGET" in *.yarc) yara_flags3+=(-C) ;; esac
-                yhit=$($YARA_CMD "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
-                [ -n "$yhit" ] && threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|yara=${yhit}|b64=${chunk:0:20}..."
-                # No YARA hit on the decoded content -> an embedded
-                # executable alone isn't enough signal, stay quiet.
-            else
-                # No YARA available to cross-check -> fall back to
-                # the older, weaker magic-bytes-only signal.
-                threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|b64=${chunk:0:20}..."
-            fi
-            rm -f "$b64tmp"
-        done < <(bb grep -oE '[A-Za-z0-9+/]{200,}={0,2}' "$file" 2>/dev/null | head -8)
+        # Base64 payload check: only runs the (separate-read) grep scan
+        # here as a FALLBACK when YARA isn't available at all — when YARA
+        # IS available, __av_b64_screen__ already covers this in the SAME
+        # read as the string/pattern matching (see process_yara_batch),
+        # so doing it again here per-file would defeat the whole point.
+        if [ "$HAS_YARA" != true ]; then
+            _check_b64_payload "$file"
+        fi
     fi
 
     # Disguised
@@ -3214,7 +3759,7 @@ run_scan_loop() {
                 BATCH_SHA+=("$file")
                 SHA_BATCH_CNT=$(( SHA_BATCH_CNT + 1 ))
                 if [ "$SHA_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
-                    process_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
+                    _timed_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
                     BATCH_SHA=(); SHA_BATCH_CNT=0
                 fi
             fi
@@ -3222,7 +3767,7 @@ run_scan_loop() {
                 BATCH_MD5+=("$file")
                 MD5_BATCH_CNT=$(( MD5_BATCH_CNT + 1 ))
                 if [ "$MD5_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
-                    process_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
+                    _timed_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
                     BATCH_MD5=(); MD5_BATCH_CNT=0
                 fi
             fi
@@ -3234,12 +3779,18 @@ run_scan_loop() {
                 JPEG|PNG|GIF) skip_deep=true ;;
             esac
 
-            # Disguised override
+            # Extension/magic mismatch override: force full YARA scanning
+            # even for image extensions that would otherwise skip_deep, so
+            # a real executable disguised as a .jpg still gets checked.
+            # The actual DISGUISED_FILE report happens once, in
+            # check_file_heuristics() below (which covers more extensions
+            # — bmp/webp/pdf/doc/xls too) — reporting it here TOO used to
+            # double-count every disguised-file hit (threats displayed
+            # once due to dedup, but counted twice).
             ext="${file##*.}"
             case "${ext,,}" in
                 jpg|jpeg|png|gif)
                     if [ "$magic_type" = "ELF" ] || [ "$magic_type" = "PE_MZ" ]; then
-                        threat "DISGUISED_FILE" "$file" "ext=.$ext|real=$magic_type"
                         skip_deep=false
                     fi
                     ;;
@@ -3249,7 +3800,7 @@ run_scan_loop() {
                 BATCH_YARA+=("$file")
                 YARA_BATCH_CNT=$(( YARA_BATCH_CNT + 1 ))
                 if [ "$YARA_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
-                    process_yara_batch "${BATCH_YARA[@]}"
+                    _timed_yara_batch "${BATCH_YARA[@]}"
                     BATCH_YARA=(); YARA_BATCH_CNT=0
                 fi
             fi
@@ -3259,7 +3810,7 @@ run_scan_loop() {
                 BATCH_HEUR+=("$file")
                 HEUR_BATCH_CNT=$(( HEUR_BATCH_CNT + 1 ))
                 if [ "$HEUR_BATCH_CNT" -ge "$HEUR_BATCH_SIZE" ]; then
-                    process_heuristic_batch "${BATCH_HEUR[@]}"
+                    _timed_heur_batch "${BATCH_HEUR[@]}"
                     BATCH_HEUR=(); HEUR_BATCH_CNT=0
                 fi
             fi
@@ -3270,7 +3821,7 @@ run_scan_loop() {
                 BATCH_PE+=("$file")
                 PE_BATCH_CNT=$(( PE_BATCH_CNT + 1 ))
                 if [ "$PE_BATCH_CNT" -ge "$PE_BATCH_SIZE" ]; then
-                    process_pe_batch "${BATCH_PE[@]}"
+                    _timed_pe_batch "${BATCH_PE[@]}"
                     BATCH_PE=(); PE_BATCH_CNT=0
                 fi
             fi
@@ -3291,11 +3842,11 @@ run_scan_loop() {
     done < "$POOL_FILE"
 
     # Flush remaining batches
-    [ "$SHA_BATCH_CNT" -gt 0 ] && process_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
-    [ "$MD5_BATCH_CNT" -gt 0 ] && process_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
-    [ "$YARA_BATCH_CNT" -gt 0 ] && process_yara_batch "${BATCH_YARA[@]}"
-    [ "$HEUR_BATCH_CNT" -gt 0 ] && process_heuristic_batch "${BATCH_HEUR[@]}"
-    [ "$PE_BATCH_CNT" -gt 0 ] && process_pe_batch "${BATCH_PE[@]}"
+    [ "$SHA_BATCH_CNT" -gt 0 ] && _timed_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
+    [ "$MD5_BATCH_CNT" -gt 0 ] && _timed_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
+    [ "$YARA_BATCH_CNT" -gt 0 ] && _timed_yara_batch "${BATCH_YARA[@]}"
+    [ "$HEUR_BATCH_CNT" -gt 0 ] && _timed_heur_batch "${BATCH_HEUR[@]}"
+    [ "$PE_BATCH_CNT" -gt 0 ] && _timed_pe_batch "${BATCH_PE[@]}"
 }
 
 # ----------------------------------------------------------------------------
@@ -3304,6 +3855,7 @@ run_scan_loop() {
 finalize_worker() {
     progress "done"
     printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\nSUPPRESSED:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" "$SUPPRESSED_FOUND" >> "$REPORT"
+    printf 'TIMING_HASH_MS:%d\nTIMING_YARA_MS:%d\nTIMING_HEUR_MS:%d\nTIMING_PE_MS:%d\n' "$T_HASH_MS" "$T_YARA_MS" "$T_HEUR_MS" "$T_PE_MS" >> "$REPORT"
     log "Completed - files: $FILES_SCANNED, threats: $THREATS_FOUND, suppressed: $SUPPRESSED_FOUND"
     touch "${REPORT_DIR}/${WORKER_ID}.done"
 }
