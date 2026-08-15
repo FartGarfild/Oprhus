@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Oprhus AV Scanner Unified v6.4 (modular + quarantine + real-time + busybox-first)
+# Oprhus AV Scanner Unified 0.2 beta (modular + quarantine + real-time + busybox-first)
 # Features:
 #   - Built-in signature updater (Maldet, ClamAV, YARA, MalwareBazaar, custom)
 #   - Parallel workers with batch hashing (SHA256 + MD5) and YARA batching
@@ -56,6 +56,11 @@
 #                            enabled) moves the whole archive.
 #   --archive-max-mb N        Skip archives bigger than this, compressed
 #                            (default: 200)
+#   --archive-ram-max-mb N    Extract archives up to this COMPRESSED size
+#                            straight into RAM (/dev/shm) instead of disk
+#                            — faster, especially on IOPS-capped hosts
+#                            (default: 50). Bigger archives fall back to
+#                            disk regardless of --archive-max-mb.
 #   --archive-max-extract-mb N Abort extraction past this much decompressed
 #                            data — defense against decompression/zip
 #                            bombs (default: 500)
@@ -255,6 +260,16 @@ EXCLUDE_PATHS=()        # -X/--exclude PATH (repeatable): extra paths/dirs
                         # being searched for. See init_self_exclude().
 DO_UPDATE=false
 USE_RAM=true
+ARCHIVE_USE_RAM=true   # captured separately from USE_RAM — see comment
+                        # where it's set, in init_workers()
+NO_RAM_EXPLICIT=""     # set when --no-ram is explicitly passed — the
+                        # low-RAM-profile auto-tuning below can force
+                        # USE_RAM=false on its own (default RAM ceiling is
+                        # 500MB, which trips that), but that heuristic is
+                        # about sizing the MAIN ephemeral WORK_DIR (which
+                        # scales with worker count) and shouldn't also
+                        # block the much smaller, independently-bounded
+                        # archive-RAM-extraction feature — see ARCHIVE_USE_RAM.
 ALLOW_BUSYBOX=true
 MB_KEY=""
 WORKERS=""            # empty = "auto", resolved in init_workers()
@@ -291,6 +306,12 @@ SCAN_ARCHIVES=false     # -A/--scan-archives: opt-in (extraction has real
 ARCHIVE_MAX_MB=200      # skip archives bigger than this (compressed size)
 ARCHIVE_MAX_EXTRACT_MB=500 # abort extraction past this much decompressed
                         # data — defense against decompression bombs
+ARCHIVE_RAM_MAX_MB=50   # extract archives up to this COMPRESSED size
+                        # straight into /dev/shm (RAM) — faster than disk,
+                        # especially on IOPS-capped hosts. Bigger archives
+                        # fall back to disk (still respects --no-ram /
+                        # /dev/shm free-space checks either way) to avoid
+                        # unbounded RAM pressure from one huge archive.
 ARCHIVE_MAX_DEPTH=2     # how many nested-archive levels to recurse into
 ARCHIVE_MAX_FILES=2000  # only scan the first N files inside one archive
 DO_SETUP=false         # --setup: build yara/yarac (and fetch busybox) then exit
@@ -999,13 +1020,14 @@ parse_args() {
             -X|--exclude)    EXCLUDE_PATHS+=("$2"); shift 2 ;;
             -A|--scan-archives)  SCAN_ARCHIVES=true; shift ;;
             --archive-max-mb)         ARCHIVE_MAX_MB="$2"; shift 2 ;;
+            --archive-ram-max-mb)     ARCHIVE_RAM_MAX_MB="$2"; shift 2 ;;
             --archive-max-extract-mb) ARCHIVE_MAX_EXTRACT_MB="$2"; shift 2 ;;
             --archive-max-depth)      ARCHIVE_MAX_DEPTH="$2"; shift 2 ;;
             --archive-max-files)      ARCHIVE_MAX_FILES="$2"; shift 2 ;;
             --yara-timeout)           YARA_TIMEOUT_SEC="$2"; shift 2 ;;
             -L|--long-time)  LONG_TIME_MODE=true; shift ;;
             --long-time-threshold)    LONG_TIME_THRESHOLD_SEC="$2"; shift 2 ;;
-            --no-ram)        USE_RAM=false; shift ;;
+            --no-ram)        USE_RAM=false; NO_RAM_EXPLICIT=1; shift ;;
             --no-busybox)    ALLOW_BUSYBOX=false; shift ;;
             -b|--busybox)    BUSYBOX_PATH_ARG="$2"; shift 2 ;;
             --busybox-url)   BUSYBOX_URL_ARG="$2"; shift 2 ;;
@@ -1094,6 +1116,14 @@ init_workers() {
             WORKERS=$max_safe
         fi
     fi
+
+    # Capture the person's ORIGINAL --no-ram preference for archive
+    # extraction BEFORE the low-RAM-profile auto-tuning below can
+    # override USE_RAM — archive RAM extraction is independently bounded
+    # by ARCHIVE_RAM_MAX_MB (default 50MB, tiny compared to a worker's own
+    # RAM ceiling) and shouldn't be silently disabled just because the
+    # overall RAM ceiling looks modest.
+    ARCHIVE_USE_RAM="$USE_RAM"
 
     if [ "$MAX_RAM_MB" -le 512 ]; then
         USE_RAM=false
@@ -2530,7 +2560,7 @@ launch_workers() {
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
             "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
             "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC"
+            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM"
         WORKER_PIDS+=($!)
     done
 }
@@ -2794,7 +2824,7 @@ start_realtime_worker() {
         "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
         "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
         "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC"
+        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM"
     REALTIME_WORKER_PID=$!
 
     # Keep the write fd (3) open permanently — opening/closing per event
@@ -3052,6 +3082,11 @@ YARA_TIMEOUT_SEC="${28:-30}"    # abort a single yara call after this long
                                  # (yara's own -a flag) — see global comment
 LONG_TIME_MODE="${29:-false}"   # -L/--long-time: log slow batches
 LONG_TIME_THRESHOLD_SEC="${30:-20}"
+ARCHIVE_RAM_MAX_MB="${31:-50}"  # extract archives up to this compressed
+                                 # size straight into RAM — see global note
+ARCHIVE_USE_RAM="${32:-true}"   # explicit --no-ram choice, NOT auto-tuned
+                                 # by the low-RAM-profile logic — see main
+                                 # script comment where it's captured
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
@@ -3575,18 +3610,20 @@ _archive_extract() {
     esac
 }
 
-# Checks ONE extracted file (from inside an archive) against hash/YARA/
-# string signatures and reports against the ORIGINAL ARCHIVE if it matches.
-# Not batched (archives are opt-in / lower volume than the main file
-# stream), so this does direct per-file checks rather than queueing into
-# the shared BATCH_* arrays.
 _archive_tmpdir() {
-    # Extract into RAM (/dev/shm) when there's room, same reasoning as the
-    # main WORK_DIR: much less I/O-bound than disk, which matters most on
-    # exactly the kind of low-end VPS where every bit of speed counts.
-    # Respects --no-ram (USE_RAM=false) and falls back to disk if /dev/shm
-    # doesn't have enough free space for the configured extraction cap.
-    if [ "$USE_RAM" = "true" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    local compressed_size_mb="${1:-0}"
+    # Extract into RAM (/dev/shm) when it makes sense, same reasoning as
+    # the main WORK_DIR: much less I/O-bound than disk, which matters most
+    # on exactly the kind of low-end/IOPS-capped VPS where every bit of
+    # speed counts. Two conditions, both must hold:
+    #   1. the ARCHIVE's own compressed size is under ARCHIVE_RAM_MAX_MB
+    #      (default 50) — bounds how much RAM one archive can claim,
+    #      independent of the (much larger) ARCHIVE_MAX_EXTRACT_MB bomb
+    #      guard, which is about the DECOMPRESSED size instead.
+    #   2. /dev/shm actually has that much free right now.
+    # Respects --no-ram (USE_RAM=false); falls back to disk for archives
+    # over the threshold, or when /dev/shm doesn't have room.
+    if [ "$ARCHIVE_USE_RAM" = "true" ] && [ "$compressed_size_mb" -le "$ARCHIVE_RAM_MAX_MB" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
         local avail
         avail=$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
         if [ "${avail:-0}" -ge "$ARCHIVE_MAX_EXTRACT_MB" ]; then
@@ -3601,31 +3638,60 @@ _archive_tmpdir() {
 # itself uses the same fast grep -qF path the main scan uses.
 _archive_batch_hash_check() {
     local top_archive="$1" extract_dir="$2" cur_rel="$3"; shift 3
-    local m msize rel
+
+    # FIX (real hang reported: an 18MB DLE zip "hanging" for over a
+    # minute): despite the name, this used to loop per-member, calling
+    # sha256sum/md5sum AND a busybox-grep lookup against sha256.tsv/
+    # md5.tsv SEPARATELY FOR EVERY FILE inside the archive — exactly the
+    # same per-file overhead problem already fixed for the main scan
+    # pipeline (busybox grep against the 632k-line md5.tsv alone measured
+    # ~1.5s/call), just never applied here. A few hundred files inside one
+    # archive meant a few hundred seconds. Now genuinely batched, same
+    # pattern as process_hash_batch(): hash the whole member set in ONE
+    # command, look up ALL hashes in ONE grep call, via the fast
+    # bundled/system grep (_real_grep), not busybox's.
+    local -a valid=()
+    local m msize
     for m in "$@"; do
         msize=$(_stat_size "$m" 2>/dev/null) || continue
         { [ "${msize:-0}" -eq 0 ] || [ "${msize:-0}" -gt "$MAX_SIZE" ]; } && continue
-        rel="${m#$extract_dir/}"
-        [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
-
-        if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
-            local h
-            h=$($SHA256_CMD "$m" 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
-            if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/sha256.tsv" 2>/dev/null; then
-                local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/sha256.tsv" | cut -f2)
-                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|sha256=$h"
-                continue
-            fi
-        fi
-        if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
-            local h
-            h=$($MD5_CMD "$m" 2>/dev/null | bb grep -oE '[0-9a-f]{32}' | head -1)
-            if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/md5.tsv" 2>/dev/null; then
-                local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/md5.tsv" | cut -f2)
-                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|md5=$h"
-            fi
-        fi
+        valid+=("$m")
     done
+    [ ${#valid[@]} -eq 0 ] && return
+
+    local rel out hits h n
+
+    if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
+        out=$($SHA256_CMD "${valid[@]}" 2>/dev/null)
+        hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | _real_grep -F -f - "$SIG_DIR/sha256.tsv" 2>/dev/null | cut -f1)
+        if [ -n "$hits" ]; then
+            while IFS= read -r h; do
+                [ -z "$h" ] && continue
+                n=$(_real_grep -m 1 "^${h}" "$SIG_DIR/sha256.tsv" 2>/dev/null | cut -f2)
+                m=$(printf '%s\n' "$out" | bb grep -iE "^${h}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
+                [ -z "$m" ] && continue
+                rel="${m#$extract_dir/}"
+                [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|sha256=$h"
+            done <<< "$hits"
+        fi
+    fi
+
+    if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
+        out=$($MD5_CMD "${valid[@]}" 2>/dev/null)
+        hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | _real_grep -F -f - "$SIG_DIR/md5.tsv" 2>/dev/null | cut -f1)
+        if [ -n "$hits" ]; then
+            while IFS= read -r h; do
+                [ -z "$h" ] && continue
+                n=$(_real_grep -m 1 "^${h}" "$SIG_DIR/md5.tsv" 2>/dev/null | cut -f2)
+                m=$(printf '%s\n' "$out" | bb grep -iE "^${h}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
+                [ -z "$m" ] && continue
+                rel="${m#$extract_dir/}"
+                [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|md5=$h"
+            done <<< "$hits"
+        fi
+    fi
 }
 
 # Batched YARA check across ALL members of one archive in ONE call. This is
@@ -3715,7 +3781,7 @@ scan_archive() {
     [ -z "$atype" ] && return
 
     local extract_dir
-    extract_dir=$(_archive_tmpdir) || return
+    extract_dir=$(_archive_tmpdir $(( asize / 1024 / 1024 ))) || return
 
     _archive_extract "$cur" "$atype" "$extract_dir"
 
