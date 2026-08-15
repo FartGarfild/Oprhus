@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Oprhus AV Scanner Unified v0.1 (modular + quarantine + real-time + busybox-first)
+# Oprhus AV Scanner Unified v6.4 (modular + quarantine + real-time + busybox-first)
 # Features:
 #   - Built-in signature updater (Maldet, ClamAV, YARA, MalwareBazaar, custom)
 #   - Parallel workers with batch hashing (SHA256 + MD5) and YARA batching
@@ -63,6 +63,25 @@
 #                            into, e.g. a zip containing a zip (default: 2)
 #   --archive-max-files N     Only scan the first N files inside one
 #                            archive (default: 2000)
+#   --yara-timeout SECONDS    Abort a single yara call after this long
+#                            (default: 30) — protects against a scan
+#                            hanging indefinitely on a pathological file.
+#                            On a timeout, that batch is retried one file
+#                            at a time with a short timeout each: fast
+#                            files still get scanned normally, and
+#                            whichever one is actually slow gets reported
+#                            (as SCAN_TIMEOUT) and skipped instead of
+#                            stalling the whole scan.
+#   -L, --long-time           Just LOG any single batch call that takes
+#                            longer than --long-time-threshold (default:
+#                            20s) — batch type, elapsed time, and the
+#                            exact file list — to <output>.slow, without
+#                            aborting or changing scan behavior at all.
+#                            Survives even a successful finish (a separate
+#                            file from the main report, which gets
+#                            overwritten with the clean summary at the
+#                            end) — tail -f it during a scan to watch live.
+#   --long-time-threshold N   Seconds threshold for -L above (default: 20)
 #   --no-ram                Force /tmp instead of /dev/shm
 #   --no-busybox            Fully disable busybox (no auto-download, no local
 #                            binary use) — system tools only
@@ -204,7 +223,7 @@ export LC_ALL=C
 # 1. GLOBALS — all script variables defined once here, before any code uses
 #    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
-VERSION="0.1"
+VERSION="0.2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # --- CLI-configured params (defaults, overridable via parse_args) ---
@@ -249,6 +268,24 @@ MAX_HEX_PATTERNS=8000 # cap on compiled hex_ere.txt entries, see compile_signatu
 BATCH_SIZE=200         # files per hash/YARA batch
 HEUR_BATCH_SIZE=200    # files per strings/hex heuristic batch
 PE_BATCH_SIZE=100      # files per PE-section (.mdb) batch
+YARA_TIMEOUT_SEC=30    # --yara-timeout: abort a yara call after this many
+                        # seconds (yara's own -a flag) — a real scan can
+                        # otherwise hang indefinitely on a pathological
+                        # file/rule combination (reported in practice: a
+                        # live yara process sitting idle-looking but never
+                        # finishing on ordinary PHP/JS files). On a
+                        # timeout, the batch is retried file-by-file with a
+                        # much shorter per-file timeout to both salvage
+                        # results from the files that AREN'T the problem
+                        # and identify+report the one(s) that are.
+LONG_TIME_MODE=false    # -L/--long-time: log any SINGLE batch call that
+                        # takes longer than LONG_TIME_THRESHOLD_SEC (batch
+                        # type, elapsed time, exact file list) to the live
+                        # report — pure observability, no behavior change.
+                        # Pairs well with --yara-timeout for cases you
+                        # want to actively abort, or use alone just to
+                        # monitor "what's slow" without touching behavior.
+LONG_TIME_THRESHOLD_SEC=20
 SCAN_ARCHIVES=false     # -A/--scan-archives: opt-in (extraction has real
                         # cost and some risk — see MODULE: archive scanning)
 ARCHIVE_MAX_MB=200      # skip archives bigger than this (compressed size)
@@ -330,6 +367,15 @@ ELAPSED_S=0
 TOTAL_FILES=0
 WORKER_PIDS=()
 MONITOR_PID=""
+HAS_SETSID=false       # set once in launch_workers()/start_realtime_worker()
+                        # — controls whether cleanup() can safely kill each
+                        # worker's WHOLE PROCESS GROUP (needed to also kill
+                        # a yara/grep/etc subprocess currently running
+                        # INSIDE a worker when the worker itself gets
+                        # killed — plain `kill $worker_pid` only kills the
+                        # worker's own PID, not its in-flight children,
+                        # which is exactly what orphaned them running
+                        # unkillable in the background after Ctrl+C).
 TF=0            # files scanned (total across workers)
 TT=0            # threats found (total across workers)
 QC=0            # quarantined (total across workers)
@@ -534,16 +580,23 @@ bb() {
 #    self-contained dd+od based detector.
 # ============================================================================
 detect_sha256() {
-    if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet sha256sum; then echo "$BUSYBOX_BIN sha256sum"
-    elif command -v sha256sum &>/dev/null; then echo "sha256sum"
+    # FIX (real bottleneck found and measured): busybox's sha256sum is
+    # ~1.8x slower than a real coreutils sha256sum on realistic file sizes
+    # (confirmed: 340ms vs 188ms hashing 200 files). Combined with the
+    # grep lookup fix below, this was the dominant cost in a real scan
+    # (hash= was 69% of total time). Same reasoning as bundling a real
+    # grep: prefer a known-fast implementation, busybox only as fallback
+    # for portability when nothing else is available.
+    if command -v sha256sum &>/dev/null; then echo "sha256sum"
+    elif [ -n "$BUSYBOX_BIN" ] && busybox_has_applet sha256sum; then echo "$BUSYBOX_BIN sha256sum"
     elif command -v shasum &>/dev/null; then echo "shasum -a 256"
     elif command -v openssl &>/dev/null; then echo "openssl dgst -sha256"
     else echo "none"; fi
 }
 
 detect_md5() {
-    if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet md5sum; then echo "$BUSYBOX_BIN md5sum"
-    elif command -v md5sum &>/dev/null; then echo "md5sum"
+    if command -v md5sum &>/dev/null; then echo "md5sum"
+    elif [ -n "$BUSYBOX_BIN" ] && busybox_has_applet md5sum; then echo "$BUSYBOX_BIN md5sum"
     elif command -v md5 &>/dev/null; then echo "md5 -q"
     elif command -v openssl &>/dev/null; then echo "openssl dgst -md5"
     else echo "none"; fi
@@ -949,6 +1002,9 @@ parse_args() {
             --archive-max-extract-mb) ARCHIVE_MAX_EXTRACT_MB="$2"; shift 2 ;;
             --archive-max-depth)      ARCHIVE_MAX_DEPTH="$2"; shift 2 ;;
             --archive-max-files)      ARCHIVE_MAX_FILES="$2"; shift 2 ;;
+            --yara-timeout)           YARA_TIMEOUT_SEC="$2"; shift 2 ;;
+            -L|--long-time)  LONG_TIME_MODE=true; shift ;;
+            --long-time-threshold)    LONG_TIME_THRESHOLD_SEC="$2"; shift 2 ;;
             --no-ram)        USE_RAM=false; shift ;;
             --no-busybox)    ALLOW_BUSYBOX=false; shift ;;
             -b|--busybox)    BUSYBOX_PATH_ARG="$2"; shift 2 ;;
@@ -1139,6 +1195,11 @@ init_live_report() {
     } >> "$LIVE_REPORT_FILE" 2>/dev/null
 
     echo -e "${C}[*] Live threat log: ${LIVE_REPORT_FILE}${Z}"
+
+    if [ "$LONG_TIME_MODE" = true ]; then
+        : > "${LIVE_REPORT_FILE}.slow" 2>/dev/null
+        echo -e "${C}[*] Slow-batch log (-L): ${LIVE_REPORT_FILE}.slow — tail -f it to watch live${Z}"
+    fi
 }
 
 # ============================================================================
@@ -1491,7 +1552,26 @@ compile_signatures() {
     local cached_version=""
     [ -f "$version_flag" ] && cached_version=$(cat "$version_flag" 2>/dev/null)
 
-    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ "$compiled_flag" -nt "$sig_input" ] && [ "$cached_version" = "$VERSION" ]; then
+    # FIX (real bug reported): comparing against $sig_input's OWN top-level
+    # mtime is fragile — creating ANY new direct child inside it (e.g. an
+    # auto-created ignore_sigs or incremental-cache file the first time
+    # either feature runs) bumps that mtime, making a cache written
+    # SECONDS earlier look "stale" on the very next invocation even though
+    # no actual signature data changed (this is exactly what caused
+    # "-u finishes, cache is fresh, but the next plain scan recompiles
+    # everything anyway"). Compare against the newest mtime among the
+    # REAL signature source files instead (excluding .cache/ itself and
+    # our own auxiliary state files) — semantically correct (what we
+    # actually care about IS whether any signature content changed) and
+    # immune to unrelated files appearing alongside it.
+    local newest_src=""
+    if [ -d "$sig_input" ]; then
+        newest_src=$(bb find "$sig_input" -mindepth 1 -not -path '*/.cache/*' \
+            -not -name "ignore_sigs" -not -name ".incremental_cache.tsv" \
+            -newer "$compiled_flag" -print -quit 2>/dev/null)
+    fi
+
+    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ -z "$newest_src" ] && [ "$cached_version" = "$VERSION" ]; then
         echo -e "[*] Signatures already compiled -> reusing cache ($cache_dir)"
         mkdir -p "$out_dir"
         cp -f "$cache_dir"/sha256.tsv "$cache_dir"/md5.tsv "$cache_dir"/hex_ere.txt \
@@ -2039,24 +2119,22 @@ EOF
         ' "$out_dir/strings.txt"
     fi
 
-    # Base64-payload SCREENING also folded into the same YARA pass — this
-    # was a separate `grep -oE` full-file read on EVERY scanned file
-    # before, regardless of whether it actually contained anything
-    # base64-looking (which most files don't). Reserved rule name
-    # "__av_b64_screen__": when it fires, the worker does the (much rarer)
-    # decode+magic-check+hash-lookup follow-up ONLY for that file, instead
-    # of scanning every file's content separately. Directly reduces total
-    # disk reads per scan, which matters most on I/O/IOPS-constrained
-    # hosts where reducing fork/process count alone stops helping once
-    # disk throughput, not CPU, is the ceiling.
-    cat << 'EOF' > "$out_dir/yara/generated_b64_screen.yar"
-rule __av_b64_screen__ {
-    strings:
-        $s = /[A-Za-z0-9+\/]{200,}={0,2}/
-    condition:
-        $s
-}
-EOF
+    # REVERTED (real regression reported): base64-payload screening used
+    # to be folded into this same YARA pass via a reserved
+    # "__av_av_b64_screen__" regex rule, to save one full-file read per
+    # scanned file (an IOPS optimization). In practice, on real DLE
+    # installations, this made specific files take 74-113+ SECONDS EACH —
+    # confirmed to be exactly DLE's own license-obfuscated engine files,
+    # which are (by design) one enormous single-line base64-ish blob.
+    # YARA's regex engine scales badly against that shape of content with
+    # an unbounded {200,} quantifier, in a way a plain `grep -oE` call
+    # (the original, pre-YARA implementation) did not — confirmed by the
+    # person: the exact same files processed correctly and faster before
+    # this optimization. Reliability beats a marginal IOPS win here, so
+    # base64 screening is back to being its own grep pass (see
+    # check_file_heuristics -> _check_b64_payload in the worker) — no
+    # generated_b64_screen.yar, no "__av_b64_screen__" rule anymore.
+    rm -f "$out_dir/yara/generated_b64_screen.yar" 2>/dev/null
 
     # YARA: gather external rule sources (fetched during -u) plus our own
     # generated NDB/LDB/string rules, and compile them ALL into one
@@ -2158,7 +2236,15 @@ EOF
 
     # Save compiled artifacts to the persistent cache so the next run can
     # reuse them without recompiling (see comment at the top of this function)
+    #
+    # FIX (real bug found): cp -rf only overwrites files that exist in the
+    # FRESH out_dir/yara — it doesn't delete stray old files already
+    # sitting in cache_dir/yara that aren't part of this compile (e.g. a
+    # generated_b64_screen.yar left over from a previous script version
+    # that no longer generates one at all). rm -rf the cache's yara/ dir
+    # first so a recompile can't leave stale artifacts behind.
     mkdir -p "$cache_dir"
+    rm -rf "$cache_dir/yara" 2>/dev/null
     cp -f "$out_dir"/sha256.tsv "$out_dir"/md5.tsv "$out_dir"/hex_ere.txt \
           "$out_dir"/strings.txt "$out_dir"/b64_payloads.tsv "$out_dir"/mdb.tsv \
           "$out_dir"/str_sig_map.tsv "$cache_dir/" 2>/dev/null || true
@@ -2414,20 +2500,37 @@ split_pools() {
     bb awk -v w="$WORKERS" -v d="$WORK_DIR/reports" '{ print > (d "/pool_" (NR % w) ".txt") }' "$WORK_DIR/all_files.tsv"
 }
 
+# Launches CMD... as its own SESSION/PROCESS GROUP LEADER when setsid is
+# available (checked once, cached in HAS_SETSID) — this is what lets
+# cleanup() below kill a worker's ENTIRE process tree (including whatever
+# yara/grep/etc subprocess it currently has running) with one signal,
+# instead of only the worker's own PID while any in-flight child gets
+# orphaned and keeps running. Falls back to a plain background launch if
+# setsid isn't available (non-Linux, minimal container) — cleanup() then
+# falls back too, matching the previous (imperfect but not worse) behavior.
+_launch_grouped() {
+    if [ "$HAS_SETSID" = true ]; then
+        setsid "$@" &
+    else
+        "$@" &
+    fi
+}
+
 launch_workers() {
     echo -e "[*] Launching ${WORKERS} workers (batch hash + YARA)...\n"
     WORKER_PIDS=()
+    command -v setsid &>/dev/null && HAS_SETSID=true
     local pool wid qdir=""
     [ "$QUARANTINE_ENABLED" = true ] && qdir="$QUARANTINE_DIR"
     for pool in "$WORK_DIR/reports"/pool_*.txt; do
         [ -f "$pool" ] || continue
         wid=$(basename "$pool" .txt)
-        bash "$WORKER_FILE" \
+        _launch_grouped bash "$WORKER_FILE" \
             "$pool" "$wid" "$WORK_DIR/reports" \
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
             "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
             "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" &
+            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC"
         WORKER_PIDS+=($!)
     done
 }
@@ -2525,7 +2628,24 @@ start_monitor() {
 cleanup() {
     kill "$MONITOR_PID" 2>/dev/null || true
     local p
-    for p in "${WORKER_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    for p in "${WORKER_PIDS[@]}"; do
+        # FIX (real bug reported): a worker currently blocked inside a
+        # foreground child call (yara/grep/etc via command substitution)
+        # does NOT pass a signal on to that child when the worker itself
+        # is killed — the child gets orphaned (re-parented to init) and
+        # keeps running/using CPU indefinitely, exactly what was observed:
+        # stopping the script left yara processes still loading the CPU.
+        # -TERM to the NEGATIVE pid signals the whole PROCESS GROUP at
+        # once (worker + whatever it currently has running), but that's
+        # only safe/correct when the worker was launched with setsid
+        # (guarantees its own PID == its own PGID — otherwise a negative
+        # PID could coincidentally target an unrelated process group).
+        if [ "$HAS_SETSID" = true ]; then
+            kill -TERM -"$p" 2>/dev/null || kill "$p" 2>/dev/null || true
+        else
+            kill "$p" 2>/dev/null || true
+        fi
+    done
     cleanup_realtime
     tput cnorm 2>/dev/null || true
 
@@ -2668,12 +2788,13 @@ start_realtime_worker() {
 
     # The worker opens the FIFO for reading and blocks inside its usual
     # run_scan_loop(), waiting for new path lines.
-    bash "$WORKER_FILE" \
+    command -v setsid &>/dev/null && HAS_SETSID=true
+    _launch_grouped bash "$WORKER_FILE" \
         "$REALTIME_FIFO" "rt" "$WORK_DIR/reports" \
         "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
         "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
         "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" &
+        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC"
     REALTIME_WORKER_PID=$!
 
     # Keep the write fd (3) open permanently — opening/closing per event
@@ -2725,7 +2846,13 @@ watch_poll() {
 
 cleanup_realtime() {
     exec 3>&- 2>/dev/null || true
-    [ -n "$REALTIME_WORKER_PID" ] && kill "$REALTIME_WORKER_PID" 2>/dev/null || true
+    if [ -n "$REALTIME_WORKER_PID" ]; then
+        if [ "$HAS_SETSID" = true ]; then
+            kill -TERM -"$REALTIME_WORKER_PID" 2>/dev/null || kill "$REALTIME_WORKER_PID" 2>/dev/null || true
+        else
+            kill "$REALTIME_WORKER_PID" 2>/dev/null || true
+        fi
+    fi
     [ -n "$REALTIME_TAIL_PID" ] && kill "$REALTIME_TAIL_PID" 2>/dev/null || true
     [ -n "$REALTIME_FIFO" ] && rm -f "$REALTIME_FIFO" 2>/dev/null || true
 }
@@ -2815,11 +2942,28 @@ main() {
     init_workdir
     check_deps
     init_quarantine
-    init_ignore_sigs
-    init_incremental_cache
 
     extract_worker
     compile_signatures "$SIGNATURES" "$SIG_DIR"
+
+    # FIX (real bug reported): these two used to run BEFORE
+    # compile_signatures. Both auto-create a file DIRECTLY inside
+    # $SIGNATURES the first time they're used (ignore_sigs,
+    # .incremental_cache.tsv) — creating a new direct child bumps the
+    # PARENT directory's own mtime. compile_signatures' cache-freshness
+    # check compares its compiled flag against exactly that parent mtime,
+    # so on the very first run after either feature's file didn't exist
+    # yet, the freshly-written cache would look "stale" on the VERY NEXT
+    # invocation even though nothing about the actual signature data had
+    # changed — forcing a full, unnecessary recompile every time (this is
+    # what caused "-u finishes, cache is fresh, but the next plain scan
+    # recompiles everything anyway"). Running them after compile_signatures
+    # sidesteps this entirely — neither has any dependency on running
+    # earlier (ignore_sigs is only consulted per-threat during scanning;
+    # the incremental cache is only consulted in collect_files(), which
+    # itself runs after this point).
+    init_ignore_sigs
+    init_incremental_cache
 
     init_live_report
 
@@ -2831,7 +2975,12 @@ main() {
     launch_workers
 
     start_monitor
-    trap cleanup INT TERM
+    # HUP added alongside INT/TERM: closing the terminal/session (not just
+    # Ctrl+C) sends SIGHUP to the foreground process group — without
+    # trapping it too, the script (and its workers) would die without
+    # cleanup running at all, leaving the same kind of orphaned processes
+    # this whole fix is about.
+    trap cleanup INT TERM HUP
 
     wait_for_workers
 
@@ -2899,6 +3048,10 @@ USE_RAM="${25:-true}"          # prefer /dev/shm for archive extraction too
 GREP_BIN="${26:-}"             # bundled static grep — see MODULE below
 SUID_VERIFY_MODE="${27:-false}" # dpkg/rpm checksum verify for SUID/SGID —
                                  # off by default, on for -w (real-time)
+YARA_TIMEOUT_SEC="${28:-30}"    # abort a single yara call after this long
+                                 # (yara's own -a flag) — see global comment
+LONG_TIME_MODE="${29:-false}"   # -L/--long-time: log slow batches
+LONG_TIME_THRESHOLD_SEC="${30:-20}"
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
@@ -3124,29 +3277,57 @@ _pe_section_table() {
 # Deliberately NOT applied to per-file calls (check_file_heuristics) — the
 # timing itself forks `date`, and doing that thousands of times would add
 # real overhead to exactly what we're trying to measure.
+#
+# -L/--long-time: when a SINGLE batch call takes longer than
+# LONG_TIME_THRESHOLD_SEC, log it immediately (batch type, elapsed time,
+# and the exact file list) — pure observability, no behavior change to
+# the scan itself. This is the direct "what got stuck" answer requested:
+# instead of inferring from a hung-looking process, the log shows exactly
+# which batch (and which files in it) was slow, the moment it happens,
+# while the scan keeps going.
+#
+# NOTE: written to a DEDICATED file (LIVE_REPORT_FILE + ".slow"), not
+# LIVE_REPORT_FILE itself — on a normal (non-interrupted) finish,
+# save_report() in the main script OVERWRITES LIVE_REPORT_FILE with the
+# clean final summary, which would silently wipe out every slow-batch
+# entry logged during a scan that ultimately completed successfully. A
+# separate file survives that regardless of how the scan ends.
+_log_if_long() {
+    local kind="$1" elapsed_ms="$2"; shift 2
+    [ "$LONG_TIME_MODE" = "true" ] || return
+    [ $(( elapsed_ms / 1000 )) -ge "$LONG_TIME_THRESHOLD_SEC" ] || return
+    [ -n "$LIVE_REPORT_FILE" ] || return
+    printf '[%s] [SLOW_BATCH] type=%s elapsed_ms=%d files=%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$kind" "$elapsed_ms" "$*" \
+        >> "${LIVE_REPORT_FILE}.slow" 2>/dev/null
+}
 _timed_hash_batch() {
     local _t0; _t0=$(_now_ms)
     process_hash_batch "$@"
     local _t1; _t1=$(_now_ms)
     T_HASH_MS=$(( T_HASH_MS + _t1 - _t0 ))
+    _log_if_long "hash" $(( _t1 - _t0 )) "$@"
 }
 _timed_yara_batch() {
     local _t0; _t0=$(_now_ms)
     process_yara_batch "$@"
     local _t1; _t1=$(_now_ms)
     T_YARA_MS=$(( T_YARA_MS + _t1 - _t0 ))
+    _log_if_long "yara" $(( _t1 - _t0 )) "$@"
 }
 _timed_heur_batch() {
     local _t0; _t0=$(_now_ms)
     process_heuristic_batch "$@"
     local _t1; _t1=$(_now_ms)
     T_HEUR_MS=$(( T_HEUR_MS + _t1 - _t0 ))
+    _log_if_long "heur" $(( _t1 - _t0 )) "$@"
 }
 _timed_pe_batch() {
     local _t0; _t0=$(_now_ms)
     process_pe_batch "$@"
     local _t1; _t1=$(_now_ms)
     T_PE_MS=$(( T_PE_MS + _t1 - _t0 ))
+    _log_if_long "pe" $(( _t1 - _t0 )) "$@"
 }
 
 # Batched (size, md5) lookup for a set of candidate PE files' sections
@@ -3457,7 +3638,19 @@ _archive_batch_yara_check() {
     local top_archive="$1" extract_dir="$2" cur_rel="$3"; shift 3
     [ $# -eq 0 ] && return
 
-    local yflags=(-d filename= -d filepath= -d extension=)
+    # FIX (real bug found — confirmed via YARA CLI source: `static int
+    # threads = YR_MAX_THREADS;`): without an explicit -p, yara defaults to
+    # its MAXIMUM allowed thread count, not something sane like nproc. That
+    # meant EVERY single yara invocation — and we already run one PER
+    # WORKER PROCESS, i.e. our own -j-controlled parallelism — was ALSO
+    # spawning its own large internal thread pool, all fighting over the
+    # same CPU cores as every other worker's yara call. Confirmed on a
+    # real 2-CPU box: 7+ concurrent yara threads/processes, load average
+    # ~5 on 2 cores — severe oversubscription that tanks throughput
+    # despite high CPU%, not genuine parallel speedup. -p 1 makes each
+    # yara call single-threaded; the worker-process level (-j) is where
+    # parallelism should live, not duplicated inside every yara call too.
+    local yflags=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC")
     case "$YARA_TARGET" in *.yarc) yflags+=(-C) ;; esac
 
     local yara_out
@@ -3465,7 +3658,7 @@ _archive_batch_yara_check() {
         local listfile
         listfile=$(mktemp 2>/dev/null) || return
         printf '%s\n' "$@" > "$listfile"
-        yara_out=$($YARA_CMD "${yflags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yflags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
         rm -f "$listfile"
     else
         local tmpdir2
@@ -3475,7 +3668,7 @@ _archive_batch_yara_check() {
             ln -sf "$f" "$tmpdir2/$(basename "$f")_$RANDOM" 2>/dev/null
         done
         local raw
-        raw=$($YARA_CMD "${yflags[@]}" -r "$YARA_TARGET" "$tmpdir2" 2>/dev/null)
+        raw=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yflags[@]}" -r "$YARA_TARGET" "$tmpdir2" 2>/dev/null)
         if [ -n "$raw" ]; then
             yara_out=$(while IFS= read -r l; do
                 [ -z "$l" ] && continue
@@ -3494,7 +3687,6 @@ _archive_batch_yara_check() {
     while IFS= read -r yline; do
         [ -z "$yline" ] && continue
         yrule=$(echo "$yline" | awk '{print $1}')
-        [ "$yrule" = "__av_b64_screen__" ] && continue
         yfile=$(echo "$yline" | cut -d' ' -f2-)
         rel="${yfile#$extract_dir/}"
         [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
@@ -3693,13 +3885,21 @@ process_hash_batch() {
 
     # "grep -F -f - sig_file" returns full "hash<TAB>name" lines, not just
     # the hash — the trailing "cut -f1" extracts the clean hash.
+    #
+    # FIX (real bottleneck found and measured on a live scan — hash
+    # lookups were 69% of total scan time): this used to go through
+    # busybox's grep, which measured ~2.2x slower than a real grep for
+    # exactly this shape of query (-F -f - against a 632k-line hash
+    # database — confirmed 1528ms vs 701ms per call on a realistic
+    # benchmark). Same fix already applied to the string-signature search
+    # — use _real_grep (bundled/system grep) here too.
     local hits
-    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | bb grep -F -f - "$sig_file" 2>/dev/null | cut -f1)
+    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | _real_grep -F -f - "$sig_file" 2>/dev/null | cut -f1)
     if [ -n "$hits" ]; then
         while IFS= read -r hit_hash; do
             [ -z "$hit_hash" ] && continue
             local tname
-            tname=$(bb grep -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -f2)
+            tname=$(_real_grep -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -f2)
             local hit_file
             hit_file=$(printf '%s\n' "$out" | bb grep -iE "^${hit_hash}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
             [ -n "$hit_file" ] && threat "KNOWN_MALWARE" "$hit_file" "name=${tname:-Malware}|$htype=$hit_hash"
@@ -3710,10 +3910,48 @@ process_hash_batch() {
 # ----------------------------------------------------------------------------
 # MODULE: yara matching
 # ----------------------------------------------------------------------------
+# Called when a --scan-list batch hit (or nearly hit) the -a timeout —
+# retries the SAME batch one file at a time with a short per-file timeout,
+# so a single pathological file doesn't cost the whole batch's results and
+# gets identified by name instead of just "the scan is stuck".
+_yara_bisect_slow_batch() {
+    local short_timeout=5
+    [ "$YARA_TIMEOUT_SEC" -lt 20 ] && short_timeout=$(( YARA_TIMEOUT_SEC / 4 ))
+    [ "$short_timeout" -lt 2 ] && short_timeout=2
+
+    local yflags2=(-d filename= -d filepath= -d extension= -p 1 -a "$short_timeout")
+    case "$YARA_TARGET" in *.yarc) yflags2+=(-C) ;; esac
+
+    local f t0 t1 out
+    for f in "$@"; do
+        t0=$(_now_ms)
+        out=$(timeout $(( short_timeout + 2 )) $YARA_CMD "${yflags2[@]}" "$YARA_TARGET" "$f" 2>/dev/null)
+        t1=$(_now_ms)
+        if [ $(( (t1 - t0) / 1000 )) -ge "$short_timeout" ]; then
+            # This is the (or a) culprit — report it as a diagnostic entry
+            # (not necessarily malicious — pathologically slow-to-scan
+            # files are usually just unusual content, e.g. one enormous
+            # minified line — but worth the person's attention either way)
+            # and move on instead of hanging the whole scan on it.
+            threat "SCAN_TIMEOUT" "$f" "yara_timeout_sec=${short_timeout}|note=file took too long to scan, skipped"
+            continue
+        fi
+        [ -z "$out" ] && continue
+        local yrule yfile spat
+        yrule=$(echo "$out" | head -1 | awk '{print $1}')
+        yfile="$f"
+        if spat=$(_resolve_str_sig "$yrule"); then
+            threat "SIG_STRING_MATCH" "$yfile" "pattern=${spat:0:50}"
+        else
+            threat "YARA_MATCH" "$yfile" "rule=$yrule"
+        fi
+    done
+}
+
 process_yara_batch() {
     [ $# -eq 0 ] || [ "$HAS_YARA" = false ] || [ "$YARA_CMD" = "none" ] && return
 
-    local yara_out yara_flags=(-d filename= -d filepath= -d extension=)
+    local yara_out yara_flags=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC")
     # A compiled ruleset (.yarc) MUST be loaded with -C, or yara tries to
     # parse the binary as rule *source* and fails outright.
     case "$YARA_TARGET" in
@@ -3731,8 +3969,34 @@ process_yara_batch() {
         local listfile
         listfile=$(mktemp 2>/dev/null) || return
         printf '%s\n' "$@" > "$listfile"
-        yara_out=$($YARA_CMD "${yara_flags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        local t0; t0=$(_now_ms)
+        # FIX (real bug reported — "goes into infinity"): yara's own -a
+        # flag was measured NOT reliably capping --scan-list duration (a
+        # real batch took 74-113 SECONDS despite the configured 30s
+        # limit). Relying only on -a meant the elapsed-time check below
+        # would only ever fire AFTER yara eventually finished on its own,
+        # however long that took — defeating the whole point of a
+        # timeout. Wrap with the shell's own `timeout` (SIGTERM then
+        # SIGKILL at the OS level) as a HARD guarantee that doesn't depend
+        # on yara's internal timeout logic working correctly at all.
+        yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        local t1; t1=$(_now_ms)
         rm -f "$listfile"
+
+        # FIX (real hang reported): a batch call that hits -a's timeout
+        # aborts the WHOLE --scan-list operation, losing results for every
+        # OTHER file in the batch too — not just the slow one. Detect a
+        # likely timeout by comparing actual elapsed time against the
+        # configured limit (yara doesn't give a clean distinct exit code
+        # for this), and if so, fall back to checking this SAME batch's
+        # files ONE AT A TIME with a much shorter per-file timeout: fast
+        # files still get scanned normally (nothing lost), and whichever
+        # file(s) also blow the short timeout get identified and reported
+        # instead of silently swallowing the whole batch or hanging again.
+        if [ $(( (t1 - t0) / 1000 )) -ge "$YARA_TIMEOUT_SEC" ]; then
+            _yara_bisect_slow_batch "$@"
+            return
+        fi
     else
         # Fallback for older yara builds without --scan-list: the CLI only
         # accepts ONE scan target (a file, or a directory with -r), so
@@ -3743,7 +4007,7 @@ process_yara_batch() {
         for f in "$@"; do
             ln -sf "$f" "$tmpdir/$(bb basename "$f" 2>/dev/null || basename "$f")_$RANDOM" 2>/dev/null
         done
-        yara_out=$($YARA_CMD "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
+        yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
         # Symlink names don't map back to real paths 1:1 in this fallback
         # path (RANDOM-suffixed to avoid collisions) — resolve via readlink.
         if [ -n "$yara_out" ]; then
@@ -3759,21 +4023,10 @@ process_yara_batch() {
     fi
 
     if [ -n "$yara_out" ]; then
-        local -A b64_screened=()
         while IFS= read -r yline; do
             [ -z "$yline" ] && continue
             local yrule; yrule=$(echo "$yline" | awk '{print $1}')
             local yfile; yfile=$(echo "$yline" | cut -d' ' -f2-)
-            if [ "$yrule" = "__av_b64_screen__" ]; then
-                # Not a threat by itself — just means "this file has a
-                # long base64-looking string somewhere". Do the (rarer)
-                # decode+check follow-up for THIS file only, once, instead
-                # of every file getting its own separate grep read.
-                [ -n "${b64_screened[$yfile]:-}" ] && continue
-                b64_screened[$yfile]=1
-                _check_b64_payload "$yfile"
-                continue
-            fi
             local spat
             if spat=$(_resolve_str_sig "$yrule"); then
                 threat "SIG_STRING_MATCH" "$yfile" "pattern=${spat:0:50}"
@@ -3877,14 +4130,14 @@ process_heuristic_batch() {
 
 # Decodes and checks candidate base64 chunks in ONE file: hash-lookup
 # against known payloads, then (if still unmatched) a follow-up YARA scan
-# of the DECODED content for anything ELF/PE/script-shaped. Extracted out
-# of check_file_heuristics so it can be called SELECTIVELY — only for
-# files that the YARA screening rule (__av_b64_screen__, see
-# compile_signatures) already flagged as containing a long base64-looking
-# string — instead of every scanned file getting its own separate
-# grep -oE read. On an IOPS-capped host this is the whole point: it's not
-# about CPU or fork count, it's about not opening/reading each file an
-# extra time for a check that, for most files, finds nothing at all.
+# of the DECODED content for anything ELF/PE/script-shaped. Runs directly
+# per-file (via check_file_heuristics) — NOT gated behind a YARA screening
+# rule anymore. That WAS tried (an embedded "__av_b64_screen__" regex rule,
+# to save one read per file), but caused a real regression: YARA's regex
+# engine scales badly against a very long single-line base64-ish blob —
+# confirmed on real DLE installations, whose own license-obfuscated engine
+# files are exactly that shape, making specific files take 74-113+
+# SECONDS each. A plain `grep -oE` call handles the same content fine.
 _check_b64_payload() {
     local file="$1"
     while IFS= read -r chunk; do
@@ -3916,9 +4169,9 @@ _check_b64_payload() {
         local dtype="SCRIPT"
         case "$magic" in 7f454c46*) dtype="ELF" ;; 4d5a*) dtype="PE_MZ" ;; esac
         if [ "$HAS_YARA" = true ]; then
-            local yara_flags3=(-d filename= -d filepath= -d extension=) yhit
+            local yara_flags3=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC") yhit
             case "$YARA_TARGET" in *.yarc) yara_flags3+=(-C) ;; esac
-            yhit=$($YARA_CMD "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
+            yhit=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
             [ -n "$yhit" ] && threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|yara=${yhit}|b64=${chunk:0:20}..."
         else
             threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|b64=${chunk:0:20}..."
@@ -3931,14 +4184,10 @@ check_file_heuristics() {
     local file="$1" size="$2" oct="$3"
 
     if [ "$size" -lt "$MAX_SIZE" ]; then
-        # Base64 payload check: only runs the (separate-read) grep scan
-        # here as a FALLBACK when YARA isn't available at all — when YARA
-        # IS available, __av_b64_screen__ already covers this in the SAME
-        # read as the string/pattern matching (see process_yara_batch),
-        # so doing it again here per-file would defeat the whole point.
-        if [ "$HAS_YARA" != true ]; then
-            _check_b64_payload "$file"
-        fi
+        # REVERTED to always running this own grep-based pass (see the
+        # REVERTED comment in compile_signatures for why) — no longer
+        # gated on HAS_YARA / a screening rule.
+        _check_b64_payload "$file"
     fi
 
     # Disguised
