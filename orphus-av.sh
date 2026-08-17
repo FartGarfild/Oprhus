@@ -1,7 +1,6 @@
 #!/bin/bash
-VERSION="0.3"
 # =============================================================================
-# Oprhus AV Scanner Unified beta (modular + quarantine + real-time + busybox-first)
+# Oprhus AV Scanner Unified (modular + quarantine + real-time + busybox-first)
 # Features:
 #   - Built-in signature updater (Maldet, ClamAV, YARA, MalwareBazaar, custom)
 #   - Parallel workers with batch hashing (SHA256 + MD5) and YARA batching
@@ -304,6 +303,7 @@ export LC_ALL=C
 # 1. GLOBALS — all script variables defined once here, before any code uses
 #    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
+VERSION="0.2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Re-exec into our OWN bundled bash (see build_bash_from_source /
@@ -344,7 +344,10 @@ ROOT_DIR="/mnt"
 ROOT_DIR_EXPLICIT=""    # set to 1 if -d/--dir was explicitly passed —
                         # lets -P/--scan-processes run standalone (process
                         # scan only, no file tree scan) when -d wasn't given
-MAX_SCAN_MB=10
+MAX_SCAN_MB=50
+MAX_SCAN_MB_EXPLICIT=""  # set to 1 if -m/--max-size was explicitly
+                        # passed — lets --deep raise the default without
+                        # overriding a person's own explicit choice
 MAX_RAM_MB=500
 OUTPUT_FILE=""
 LIVE_REPORT_FILE=""    # persistent (outside WORK_DIR) file threats are
@@ -363,13 +366,15 @@ GENERIC_OBFUSCATION_RULES_FILE=""  # see init_vendor_obfuscation_allowlist
 KNOWN_VENDOR_OBFUSCATION_FILE=""   # see init_vendor_obfuscation_allowlist
 EXCLUDE_PATHS=()        # -X/--exclude PATH (repeatable): extra paths/dirs
                         # to skip. Always ALSO includes the scanner's own
-                        # install dir, signature dir, quarantine dir, and
-                        # report files — otherwise scanning a target that
-                        # happens to contain the AV's own installation
-                        # (e.g. scanning "/" or "/root") makes every YARA
-                        # rule/signature file detect ITSELF, since the
-                        # signature files literally contain the patterns
-                        # being searched for. See init_self_exclude().
+                        # install dir, signature dir, quarantine dir, work
+                        # dir, and report files — otherwise scanning a
+                        # target that happens to contain the AV's own
+                        # installation (e.g. scanning "/" or "/root")
+                        # makes every YARA rule/signature file detect
+                        # ITSELF, since the signature files literally
+                        # contain the patterns being searched for. Logic
+                        # lives inline in collect_files(), not a
+                        # separately-named function.
 DO_UPDATE=false
 USE_RAM=true
 ARCHIVE_USE_RAM=true   # captured separately from USE_RAM — see comment
@@ -479,15 +484,23 @@ INCREMENTAL_EXPLICIT_OFF=""
 INCREMENTAL_CACHE_FILE=""  # default set in init_incremental_cache()
 SKIPPED_UNCHANGED=0     # files skipped this run because the cache says
                         # they're unchanged since they were last found clean
-SUID_VERIFY_MODE=false  # dpkg/rpm package-checksum verification for
-                        # SUID/SGID files — auto-on for -w, or explicitly
-                        # via --verify-suid / --deep for a one-off scan.
-                        # Its value is catching a system binary being
-                        # SWAPPED, which mattered most for continuous
-                        # monitoring when this was designed — but hosting
-                        # audits usually run a one-off scan wanting MAXIMUM
-                        # thoroughness, not the fast default, so it's easy
-                        # to opt into without needing -w just for this.
+SUID_VERIFY_MODE=true   # dpkg/rpm package-checksum verification for
+                        # SUID/SGID files — ON BY DEFAULT (changed from
+                        # opt-in): the existing "unowned" short-circuit
+                        # (see _verify_package_file) already skips the
+                        # dpkg lookup entirely for anything outside
+                        # /usr,/bin,/sbin,/lib,/opt, so this only costs a
+                        # dpkg -S call for the small, fixed set of REAL
+                        # system SUID/SGID binaries — not the unbounded
+                        # cost the old opt-in gate was guarding against.
+                        # Real complaint this fixes: a normal one-off scan
+                        # unconditionally reported passwd/sudo/su/mount/
+                        # ssh-keysign/etc (every standard Ubuntu SUID
+                        # binary, plus its snap-packaged duplicates) EVERY
+                        # single run, package-verified-clean or not —
+                        # pure noise a person has to re-triage each time.
+                        # --no-verify-suid restores the old raw/unverified
+                        # behavior if dpkg isn't trusted or available.
 SUID_VERIFY_EXPLICIT_OFF=""
 DEEP_MODE=false         # --deep/--paranoid: convenience umbrella for a
                         # one-off scan that wants -w's extra scrutiny
@@ -1275,7 +1288,7 @@ parse_args() {
             -j|--workers)    WORKERS="$2"; WORKERS_EXPLICIT=1; shift 2 ;;
             -d|--dir)        ROOT_DIR="$2"; ROOT_DIR_EXPLICIT=1; shift 2 ;;
             -s|--sigs)       SIGNATURES="$2"; shift 2 ;;
-            -m|--max-size)   MAX_SCAN_MB="$2"; shift 2 ;;
+            -m|--max-size)   MAX_SCAN_MB="$2"; MAX_SCAN_MB_EXPLICIT=1; shift 2 ;;
             -o|--output)     OUTPUT_FILE="$2"; shift 2 ;;
             --ignore-sigs)   IGNORE_SIGS_FILE="$2"; shift 2 ;;
             -X|--exclude)    EXCLUDE_PATHS+=("$2"); shift 2 ;;
@@ -1291,7 +1304,17 @@ parse_args() {
             -K|--check-kernel)   CHECK_KERNEL=true; shift ;;
             --offline-root)      OFFLINE_ROOT="$2"; shift 2 ;;
             --sig-in-ram)        SIG_IN_RAM=true; shift ;;
-            --deep|--paranoid)   SUID_VERIFY_MODE=true; SCAN_ARCHIVES=true; DEEP_MODE=true; shift ;;
+            --deep|--paranoid)   SUID_VERIFY_MODE=true; SCAN_ARCHIVES=true; DEEP_MODE=true
+                                 # Real gap found: the default 10MB deep-
+                                 # inspection cap (hash/YARA/strings ALL
+                                 # gated on it) silently skipped files
+                                 # like /var/lib/clamav/main.cvd (89MB) —
+                                 # a blind spot --deep's own "no
+                                 # exclusions" philosophy shouldn't have.
+                                 # Bumped unless the person ALSO passed an
+                                 # explicit -m/--max-size of their own.
+                                 [ -z "$MAX_SCAN_MB_EXPLICIT" ] && MAX_SCAN_MB=200
+                                 shift ;;
             -L|--long-time)  LONG_TIME_MODE=true; shift ;;
             --long-time-threshold)    LONG_TIME_THRESHOLD_SEC="$2"; shift 2 ;;
             --no-ram)        USE_RAM=false; NO_RAM_EXPLICIT=1; shift ;;
@@ -1464,6 +1487,22 @@ init_ignore_sigs() {
 # for license protection — generic webshell-obfuscation heuristics can't
 # tell that apart from an actual backdoor by pattern alone).
 #
+# Active by default (not commented out) — affects virtually anyone
+# scanning system binaries, not specific to any one server: the real
+# /usr/sbin/chroot binary (and its snap-packaged duplicates under
+# /snap/core*/*/usr/sbin/chroot) contains the literal string "/bin/sh -i"
+# as part of its own internal fallback-shell logic, not because it's
+# compromised. Scoped to paths ending in /sbin/chroot specifically — the
+# same pattern text on any OTHER file still triggers normally.
+pattern=/bin/sh -i.*/sbin/chroot$
+#
+# Same class of false positive, different universal system file: the
+# netcat-openbsd manual page (/usr/share/man/man1/nc_openbsd.1.gz)
+# documents "-e /bin/sh -i"-style usage examples as part of explaining
+# what the flag does — text content, not an actual reverse shell.
+# Present on any Debian/Ubuntu box with netcat-openbsd installed.
+pattern=/bin/sh -i.*nc_openbsd\.1\.gz$
+#
 # Examples (uncomment / adapt the path to your actual install):
 # rule=WEBSHELL_PHP_Dynamic_Big.*/upload/engine/
 # rule=WEBSHELL_PHP_Encoded_Big.*/upload/engine/
@@ -1510,6 +1549,7 @@ init_vendor_obfuscation_allowlist() {
 ^WEBSHELL_PHP_OBFUSC_Encoded_Mixed_Dec_And_Hex$
 ^WEBSHELL_PHP_OBFUSC_Fopo$
 ^WEBSHELL_PHP_Gzinflated$
+^webshell_php_by_string_obfuscation$
 EOF
     fi
 
@@ -2372,6 +2412,20 @@ EOF
         rm -f "$tmp_generic" "$tmp_generic_out"
     fi
 
+    # Guarantee every expected output file exists (even empty) regardless
+    # of whether the awk distribution below actually found any matching
+    # lines — FIX (real bug found): awk's ">>" only creates a file the
+    # first time that specific print branch actually fires, so a
+    # signature set with zero SHA1 entries (common — the real ClamAV .hsb
+    # format turned out to carry almost none) left sha1.tsv never created
+    # at all. Later reads did `wc -l < sha1.tsv` — a MISSING input file
+    # for a shell redirect fails at the shell level, which "2>/dev/null"
+    # on that same command does NOT suppress (confirmed in practice: a
+    # stray "No such file or directory" on stderr despite the redirect).
+    touch "$out_dir/sha256.tsv" "$out_dir/sha1.tsv" "$out_dir/md5.tsv" \
+          "$out_dir/strings.txt" "$out_dir/b64_payloads.tsv" "$out_dir/hex_ere.txt" \
+          "$out_dir/mdb.tsv" 2>/dev/null
+
     if [ -s "$tmp_raw_sigs" ]; then
         # Distribute the merged processed stream into the .tsv/.txt/.yar outputs
         bb awk -F'\t' -v out="$out_dir" '
@@ -2656,7 +2710,53 @@ choose_work_dir() {
     echo "${TMPDIR:-/tmp}/av_scan_$$"
 }
 
+_sweep_stale_shm_dirs() {
+    # FIX (real leftover found in practice: a real archive-extraction
+    # directory from Aug 15 was STILL sitting in /dev/shm days later,
+    # despite scan_archive() ending with its own rm -rf). Root cause:
+    # cleanup()'s worker kill (kill -TERM -$PGID) terminates a worker
+    # mid-extraction OUTRIGHT — it never reaches its own cleanup line —
+    # and the same is unavoidably true for SIGKILL/a hard crash, which no
+    # trap anywhere could ever catch. Sweep any of THIS scanner's own
+    # /dev/shm directories at the START of a fresh run instead of trying
+    # to make every possible kill path individually reliable — anything
+    # found here is guaranteed orphaned, since this run has not yet
+    # created any of its own (each run's dirs are freshly randomized via
+    # mktemp/$$, so there is zero risk of touching a directory actually
+    # in use by another concurrent run).
+    [ -d /dev/shm ] || return
+    local d
+    for d in /dev/shm/av_arch_* /dev/shm/av_chroot.* /dev/shm/av_sigs_* /dev/shm/av_scan_*; do
+        [ -d "$d" ] || continue
+        rm -rf "$d" 2>/dev/null
+    done
+    # Same sweep, disk side — _archive_tmpdir()'s non-RAM fallback creates
+    # av_arch_* dirs under TMPDIR/tmp too (only its RAM path was covered
+    # here before, and separately, that fallback used to have no prefix
+    # at all — see the fix in _archive_tmpdir itself). Real leftovers
+    # from BEFORE that prefix fix will be un-prefixed "tmp.XXXXXXXXXX" and
+    # can't be told apart from unrelated system temp dirs by name alone —
+    # those need a one-time manual cleanup; anything created going
+    # forward is swept here same as the /dev/shm case.
+    local tdir="${TMPDIR:-/tmp}"
+    [ -d "$tdir" ] || return
+    for d in "$tdir"/av_arch_* "$tdir"/av_chroot.* "$tdir"/av_scan_*; do
+        [ -d "$d" ] || continue
+        rm -rf "$d" 2>/dev/null
+    done
+    # FIX (real leak found in practice — grew by exactly 3-per-worker on
+    # every Ctrl+C'd run): av_filtered_* are FILES, not directories (the
+    # per-worker filtered ignore_sigs/generic_obfuscation_rules/
+    # known_vendor_obfuscation copies) — same orphan-on-interrupt problem,
+    # different resource type, so a separate "-f" check rather than "-d".
+    for d in "$tdir"/av_filtered_*; do
+        [ -f "$d" ] || continue
+        rm -f "$d" 2>/dev/null
+    done
+}
+
 init_workdir() {
+    _sweep_stale_shm_dirs
     WORK_DIR=$(choose_work_dir "$USE_RAM" "$WORKERS")
     WORKER_FILE="$WORK_DIR/worker.sh"
 
@@ -3115,12 +3215,26 @@ collect_files() {
     local excl=(-not -path "/proc/*" -not -path "/sys/*" -not -path "/dev/*")
 
     # Always exclude the scanner's own footprint (install dir, signature
-    # dir, quarantine dir, live report file) — otherwise scanning a target
-    # that happens to contain the AV's own installation makes every YARA
-    # rule/signature file "detect" itself, since it literally contains the
-    # patterns being searched for (confirmed in practice: scanning "/"
-    # produced hundreds of self-matches against signatures/yara/*.yar).
-    local self_paths=("$SCRIPT_DIR" "$SIGNATURES")
+    # dir, quarantine dir, ephemeral work dir, live report file) —
+    # otherwise scanning a target that happens to contain the AV's own
+    # installation makes every YARA rule/signature file "detect" itself,
+    # since it literally contains the patterns being searched for
+    # (confirmed in practice: scanning "/" produced hundreds of
+    # self-matches against signatures/yara/*.yar). This logic lives here
+    # inline, not in a separately-named function — if you're looking for
+    # "init_self_exclude()" from an old comment elsewhere, this is it.
+    #
+    # FIX (real bug reported): WORK_DIR was missing from this list —
+    # SCRIPT_DIR and SIGNATURES were covered, but the EPHEMERAL per-run
+    # work directory (worker.sh, reports, extracted setup module) was
+    # not, so worker.sh itself — which necessarily contains the literal
+    # string patterns this scanner looks for, since that's what a copy
+    # of its own detection logic looks like — got flagged scanning its
+    # own temp file. Confirmed in practice: "/tmp/av_scan_NNNNN/worker.sh
+    # pattern=eval(base64_decode". SIG_DIR listed separately too — it's
+    # usually WORK_DIR/sigs (already covered), but --sig-in-ram can place
+    # it at its own /dev/shm/av_sigs_NNNNN path outside WORK_DIR entirely.
+    local self_paths=("$SCRIPT_DIR" "$SIGNATURES" "$WORK_DIR" "$SIG_DIR")
     [ "$QUARANTINE_ENABLED" = true ] && self_paths+=("$QUARANTINE_DIR")
     local p
     for p in "${self_paths[@]}"; do
@@ -3607,11 +3721,10 @@ main() {
         INCREMENTAL_MODE=false
     fi
 
-    # Same reasoning for SUID/SGID package-checksum verification: a
-    # one-off audit scan (no cache, run once, the common case) shouldn't
-    # pay dpkg lookups it'll never benefit from again — but -w keeps the
-    # worker alive watching the SAME tree, where catching a system binary
-    # getting swapped mid-monitoring is exactly the point.
+    # SUID_VERIFY_MODE is true by default now (see its declaration) — this
+    # block is effectively a no-op today, kept only so --no-verify-suid
+    # (which sets SUID_VERIFY_EXPLICIT_OFF) still wins over -w if someone
+    # explicitly wants raw/unverified SUID reporting even in real-time mode.
     if [ "$REALTIME_MODE" = true ] && [ -z "$SUID_VERIFY_EXPLICIT_OFF" ]; then
         SUID_VERIFY_MODE=true
     fi
@@ -3764,6 +3877,36 @@ main "$@"
 set -uo pipefail
 export LC_ALL=C
 
+# Tracks archive-extraction directories currently in use by scan_archive()
+# — see the trap below and the array-append in scan_archive() itself. If
+# this worker gets TERM'd/INT'd while mid-extraction (e.g. the main
+# script's cleanup() killing workers on Ctrl+C), it would otherwise die
+# outright without ever reaching scan_archive()'s own end-of-function
+# rm -rf, leaking the directory (confirmed in practice — a real leftover
+# extraction sat in /dev/shm for two days after an interrupted archive
+# scan). This is defense-in-depth for the common graceful-interrupt case;
+# it cannot catch SIGKILL/a hard crash, which is what the startup sweep
+# in the main script's init_workdir() exists for instead — the two
+# together cover both the common case and the case nothing can trap.
+declare -a _ACTIVE_EXTRACT_DIRS=()
+_cleanup_active_extractions() {
+    local d
+    for d in "${_ACTIVE_EXTRACT_DIRS[@]:-}"; do
+        # FIX (real bug found in testing): this array tracks BOTH archive
+        # extraction DIRECTORIES and the three filtered pattern FILES
+        # (ignore_sigs/generic_obfuscation_rules/known_vendor_obfuscation
+        # copies) — but this check was "-d" (directory) only, a leftover
+        # from when the array was archive-dirs-only. For the file
+        # entries, "-d" is always false, so "&&" short-circuited and
+        # rm -rf NEVER ran for them — confirmed directly: the trap fired
+        # with the exact correct paths logged, yet the files remained on
+        # disk untouched afterward. "-e" (exists, either type) covers both.
+        [ -n "$d" ] && [ -e "$d" ] && rm -rf "$d" 2>/dev/null
+    done
+    exit 143
+}
+trap _cleanup_active_extractions TERM INT
+
 # ----------------------------------------------------------------------------
 # GLOBALS — all worker variables defined once here, before any function
 # uses them.
@@ -3858,9 +4001,19 @@ _filter_patterns_file() {
     [ -n "$src" ] && [ -s "$src" ] || { : > "$dst" 2>/dev/null; return; }
     bb grep -v '^[[:space:]]*#' "$src" 2>/dev/null | bb grep -v '^[[:space:]]*$' > "$dst" 2>/dev/null
 }
-_IGNORE_SIGS_FILTERED="$(mktemp 2>/dev/null || echo /tmp/av_ignore_sigs_filtered.$$)"
-_GENERIC_OBFUSCATION_FILTERED="$(mktemp 2>/dev/null || echo /tmp/av_generic_obf_filtered.$$)"
-_KNOWN_VENDOR_OBFUSCATION_FILTERED="$(mktemp 2>/dev/null || echo /tmp/av_vendor_obf_filtered.$$)"
+_IGNORE_SIGS_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_ignore_sigs.$$")"
+_GENERIC_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_generic_obf.$$")"
+_KNOWN_VENDOR_OBFUSCATION_FILTERED="$(mktemp "${TMPDIR:-/tmp}/av_filtered_XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/av_filtered_vendor_obf.$$")"
+# FIX (real leak found in practice — Ctrl+C during a scan left these
+# behind, growing by 3-per-worker on every subsequent interrupted run):
+# these three live for the worker's WHOLE lifetime (created once here at
+# startup, only removed in finalize_worker() on NORMAL completion) — a
+# bare, unprefixed mktemp meant an interrupt anywhere in between leaked
+# an unidentifiable "tmp.XXXXXXXXXX" file, same class of bug as the
+# archive-extraction directories fixed earlier. Now prefixed (sweepable
+# by _sweep_stale_shm_dirs at the next run's startup) AND tracked in the
+# same active-resource array the TERM/INT trap already cleans up below.
+_ACTIVE_EXTRACT_DIRS+=("$_IGNORE_SIGS_FILTERED" "$_GENERIC_OBFUSCATION_FILTERED" "$_KNOWN_VENDOR_OBFUSCATION_FILTERED")
 # NOTE: the actual _filter_patterns_file CALLS happen further down, after
 # this worker's own bb() is defined — bb() is a function, and top-level
 # code in a bash script runs sequentially as it's reached, so calling
@@ -4672,7 +4825,18 @@ _archive_tmpdir() {
             mktemp -d /dev/shm/av_arch_XXXXXX 2>/dev/null && return
         fi
     fi
-    mktemp -d 2>/dev/null
+    # FIX (real bug found in practice): this fallback used to be a bare
+    # `mktemp -d` with no template — every large/disk-fallback archive
+    # extraction got an UNPREFIXED "tmp.XXXXXXXXXX" name indistinguishable
+    # from any other random system tmp dir. That meant these directories
+    # were invisible to both the startup stale-dir sweep (which matches
+    # on the "av_*" prefix) and self-exclusion — confirmed in practice: a
+    # "/" scan re-discovered its OWN old leftover extractions sitting in
+    # /tmp as if they were regular target files, re-reporting the same
+    # DLE content a second time under a path that looked unrelated to
+    # this scanner at all. Prefixed now, matching every other tmp dir
+    # this script creates.
+    mktemp -d "${TMPDIR:-/tmp}/av_arch_XXXXXX" 2>/dev/null
 }
 
 # Batched hash check across ALL members of one archive at once — computing
@@ -4826,6 +4990,13 @@ scan_archive() {
 
     local extract_dir
     extract_dir=$(_archive_tmpdir $(( asize / 1024 / 1024 ))) || return
+    # Tracked so a graceful interrupt (TERM/INT — see trap near the top of
+    # this worker script) can still clean this up even if the worker gets
+    # killed mid-extraction, before reaching this function's own rm -rf at
+    # the end. Not removed from the array on the normal path below — a
+    # second rm -rf on an already-gone directory is a harmless no-op, and
+    # keeping this simple matters more than pruning it precisely.
+    _ACTIVE_EXTRACT_DIRS+=("$extract_dir")
 
     _archive_extract "$cur" "$atype" "$extract_dir"
 
@@ -5351,18 +5522,22 @@ check_file_heuristics() {
             # mismatch on a package-owned SUID binary is a strong compromise
             # indicator, not a minor discrepancy).
             #
-            # SUID_VERIFY_MODE gate: dpkg verification's value is catching
-            # a system binary being swapped WHILE something is watching —
-            # that's -w (real-time)'s job. A one-off audit scan (no cache,
-            # run once, the common case) gets nothing back for paying
-            # dpkg lookup cost on every SUID/SGID hit it'll never see
-            # again, so it just reports them plainly instead, same as
-            # before this feature existed.
+            # SUID_VERIFY_MODE is on by default now (see its declaration)
+            # — this just gates whether verification runs at all
+            # (--no-verify-suid skips it entirely, e.g. if dpkg isn't
+            # trusted/available). DEEP_MODE separately controls whether a
+            # VERIFIED-clean file still gets suppressed — consistent with
+            # --deep's "no automatic filtering" rule elsewhere, a person
+            # running a deep/paranoid pass sees every SUID/SGID file
+            # regardless of verification status, with that status noted
+            # as context rather than used to hide anything.
             if [ "$SUID_VERIFY_MODE" = "true" ]; then
                 local suid_status
                 suid_status=$(_verify_package_file "$file")
                 case "$suid_status" in
-                    verified) : ;;  # known-good system binary, no report
+                    verified)
+                        [ "$DEEP_MODE" = "true" ] && threat "SUID_SGID" "$file" "perms=$oct|verified (package checksum matches)"
+                        ;;
                     tampered) threat "SUID_SGID" "$file" "perms=$oct|TAMPERED (fails package checksum verification)" ;;
                     *)        threat "SUID_SGID" "$file" "perms=$oct" ;;
                 esac
