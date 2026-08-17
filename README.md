@@ -1,5 +1,5 @@
 
-# Oprhus AV Scanner Unified beta
+# Orphus AV Scanner Unified beta
 
 **Легкий, високопродуктивний і повністю автономний антивірусний сканер для Linux**, написаний на чистому Bash.
 
