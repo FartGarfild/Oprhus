@@ -56,6 +56,11 @@
 #                            enabled) moves the whole archive.
 #   --archive-max-mb N        Skip archives bigger than this, compressed
 #                            (default: 200)
+#   --archive-ram-max-mb N    Extract archives up to this COMPRESSED size
+#                            straight into RAM (/dev/shm) instead of disk
+#                            — faster, especially on IOPS-capped hosts
+#                            (default: 50). Bigger archives fall back to
+#                            disk regardless of --archive-max-mb.
 #   --archive-max-extract-mb N Abort extraction past this much decompressed
 #                            data — defense against decompression/zip
 #                            bombs (default: 500)
@@ -63,6 +68,39 @@
 #                            into, e.g. a zip containing a zip (default: 2)
 #   --archive-max-files N     Only scan the first N files inside one
 #                            archive (default: 2000)
+#   --yara-timeout SECONDS    Abort a single yara call after this long
+#                            (default: 30) — protects against a scan
+#                            hanging indefinitely on a pathological file.
+#                            On a timeout, that batch is retried one file
+#                            at a time with a short timeout each: fast
+#                            files still get scanned normally, and
+#                            whichever one is actually slow gets reported
+#                            (as SCAN_TIMEOUT) and skipped instead of
+#                            stalling the whole scan.
+#   -L, --long-time           Just LOG any single batch call that takes
+#                            longer than --long-time-threshold (default:
+#                            20s) — batch type, elapsed time, and the
+#                            exact file list — to <output>.slow, without
+#                            aborting or changing scan behavior at all.
+#                            Survives even a successful finish (a separate
+#                            file from the main report, which gets
+#                            overwritten with the clean summary at the
+#                            end) — tail -f it during a scan to watch live.
+#   --long-time-threshold N   Seconds threshold for -L above (default: 20)
+#   --sandbox-mode MODE       Isolate archive EXTRACTION (the highest-risk
+#                            operation — parsing attacker-controlled zip/
+#                            tar/7z/rar) as defense-in-depth against a bug
+#                            in the extractor itself being exploited by a
+#                            malicious archive. auto|bwrap|unshare|chroot|
+#                            simple|none (default: none — off, changes
+#                            nothing unless explicitly requested). auto
+#                            picks the strongest available: bwrap >
+#                            unshare > simple. Rewritten from a person's
+#                            draft after finding and fixing several real
+#                            bugs during review/testing (broken bwrap
+#                            argument passing, leaked chroot bind mounts,
+#                            missing access to the archive/extraction tool
+#                            paths inside the isolated filesystem view).
 #   --no-ram                Force /tmp instead of /dev/shm
 #   --no-busybox            Fully disable busybox (no auto-download, no local
 #                            binary use) — system tools only
@@ -74,8 +112,97 @@
 #                            i.e. read-only, not executable)
 #   -w, --real-time         After the base scan, switch to background watch
 #                            mode: new files get scanned automatically
-#                            (inotifywait, or polling as fallback)
+#                            (inotifywait, or polling as fallback). Also
+#                            auto-enables -I (incremental) and dpkg SUID
+#                            verification (see both below) — real-time's
+#                            whole point is running/watching continuously,
+#                            which is exactly when both pay off.
 #   --watch-interval SEC    Polling interval for the fallback watcher (default: 5)
+#   -I, --incremental        Skip files unchanged (mtime+size) since they
+#                            were last found clean, using a persistent
+#                            cache under the signature dir. Auto-on for -w;
+#                            use --no-incremental to force it off there.
+#   --incremental-cache PATH Override the cache file location (default:
+#                            signatures/.incremental_cache.tsv)
+#   --verify-suid            Verify SUID/SGID files against the distro
+#                            package manager's checksum DB (dpkg/rpm) to
+#                            suppress known-legitimate system binaries
+#                            (sudo, su, mount, ...) and flag ones that
+#                            don't match as TAMPERED. Off by default for a
+#                            one-off scan (the common case: no cache, run
+#                            once — dpkg lookups it'll never benefit from
+#                            again aren't worth paying for), auto-on for
+#                            -w where catching a system binary getting
+#                            swapped WHILE something is watching is the
+#                            actual point. Use --no-verify-suid to force
+#                            it off even under -w.
+#   --low-priority           Renice + ionice this process (and everything
+#                            it spawns) to the lowest CPU/disk priority, and
+#                            default to a single worker unless -j overrides
+#                            — for running unobtrusively alongside other
+#                            services on the same box (e.g. -w in the
+#                            background long-term).
+#   -P, --scan-processes     Check running processes for simple rootkit
+#                            indicators: a process whose backing binary
+#                            was deleted from disk (still running, but
+#                            invisible to any file-based scan — the
+#                            classic "malware deletes itself, keeps
+#                            running in memory" case), a live process
+#                            hashing to a known-malware signature, an
+#                            LD_PRELOAD hooking indicator, and a process
+#                            visible in /proc but hidden from `ps`. Can
+#                            run standalone (no -d needed — just checks
+#                            processes and exits) or alongside a normal
+#                            file scan. Does NOT and cannot reliably catch
+#                            a genuine kernel-level (LKM) rootkit, which
+#                            can lie to /proc itself same as any tool.
+#   -K, --check-kernel        Check kernel image / initramfs / loaded
+#                            module (.ko) files against the package
+#                            manager's own recorded checksums (dpkg -V
+#                            logic) — a tampered boot file or a module not
+#                            owned by any package is a strong persistence
+#                            indicator. MEANINGLESS RUN AGAINST THE LIVE
+#                            SYSTEM if that system's own kernel is what's
+#                            compromised (same limitation as -P — it can
+#                            lie to this check too). Only really means
+#                            something paired with --offline-root, run
+#                            from your host's rescue/recovery boot (every
+#                            major provider offers one — the practical
+#                            cloud-VPS equivalent of a LiveCD).
+#   --offline-root PATH       Point every check (including -K, and the
+#                            normal file scan via -d) at a MOUNTED, NOT
+#                            BOOTED disk instead of the live filesystem —
+#                            e.g. after booting your provider's rescue
+#                            system and mounting the suspect disk at
+#                            /mnt/suspect-root:
+#                              ./av.sh --offline-root /mnt/suspect-root \
+#                                -K -d /mnt/suspect-root
+#                            This is what makes -K meaningful against a
+#                            real kernel-level rootkit — everything reads
+#                            through the RESCUE kernel, not a potentially
+#                            compromised one. Booting into rescue mode
+#                            itself is always a manual step through your
+#                            provider's control panel — nothing here can
+#                            or should try to trigger that automatically
+#                            from within a system you don't trust the
+#                            kernel of. Incompatible with -P (no running
+#                            processes to inspect on an unmounted disk).
+#   --sig-in-ram              Force the compiled signature set (hash/YARA
+#                            databases) into /dev/shm specifically,
+#                            independent of the general RAM-ceiling
+#                            decision that governs everything else — for
+#                            powerful boxes with room to spare, guarantees
+#                            every batch lookup is a RAM hit instead of
+#                            hoping the OS page cache wasn't evicted.
+#   --deep, --paranoid        One-off scan with maximum scrutiny: turns on
+#                            SUID/SGID package verification and archive
+#                            scanning (both -w-only by default), skips
+#                            incremental-cache shortcuts, and — the main
+#                            point — bypasses EVERY automatic suppression
+#                            mechanism (ignore_sigs, the vendor-
+#                            obfuscation allowlist) so nothing is
+#                            filtered out before you see it. The person
+#                            decides what's a false positive, not the tool.
 #   --max-hex-patterns N    Cap on compiled hex signature patterns (default:
 #                            8000) — grep -E -f cannot build a usable match
 #                            automaton from a full real ClamAV .ndb+.ldb set
@@ -176,12 +303,47 @@ export LC_ALL=C
 # 1. GLOBALS — all script variables defined once here, before any code uses
 #    them. init_*/detect_* functions and parse_args() fill in real values.
 # ============================================================================
-VERSION="0.1"
+VERSION="0.2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Re-exec into our OWN bundled bash (see build_bash_from_source /
+# --setup), if it's present, and we aren't already running under it — as
+# early as possible, before any other code runs. Rootkits (Diamorphine,
+# t0rn-style, and others) commonly patch system binaries that admin
+# tooling routinely runs through, /bin/bash among them — narrows how much
+# of this scan's own execution ever touches a potentially-tampered
+# interpreter. AV_NO_REEXEC=1 escapes this (debugging, or intentionally
+# testing under system bash).
+#
+# HONEST LIMIT, stated plainly rather than implied: this does NOT fully
+# solve the problem. Whatever shell interprets THIS invocation, up to and
+# including the moment this check itself runs, is still exposed — no
+# script can fully bootstrap trust in its own interpreter from within
+# that same interpreter. Real protection comes from copying av.sh +
+# bin/bash from a known-clean source and running "./bin/bash ./av.sh"
+# directly, never touching system bash at all. This re-exec narrows
+# exposure for the common case (person just runs "bash av.sh" or
+# "./av.sh"), it does not eliminate it.
+if [ -z "${AV_NO_REEXEC:-}" ] && [ -z "${AV_REEXECD:-}" ] && [ -x "$SCRIPT_DIR/bin/bash" ]; then
+    if [ "$(readlink -f "$(command -v bash 2>/dev/null)" 2>/dev/null)" != "$(readlink -f "$SCRIPT_DIR/bin/bash" 2>/dev/null)" ]; then
+        AV_REEXECD=1 exec "$SCRIPT_DIR/bin/bash" "$0" "$@"
+    fi
+fi
+
+# Used everywhere this script launches ANOTHER bash process of its own
+# (workers, the extracted setup module) — same reasoning as the re-exec
+# above, just extended to child processes too, since a plain literal
+# "bash" in those spots would resolve through $PATH to whatever system
+# bash provides, undoing the point of re-exec'ing in the first place.
+WORKER_BASH="bash"
+[ -x "$SCRIPT_DIR/bin/bash" ] && WORKER_BASH="$SCRIPT_DIR/bin/bash"
 
 # --- CLI-configured params (defaults, overridable via parse_args) ---
 SIGNATURES="${SCRIPT_DIR}/signatures"
 ROOT_DIR="/mnt"
+ROOT_DIR_EXPLICIT=""    # set to 1 if -d/--dir was explicitly passed —
+                        # lets -P/--scan-processes run standalone (process
+                        # scan only, no file tree scan) when -d wasn't given
 MAX_SCAN_MB=10
 MAX_RAM_MB=500
 OUTPUT_FILE=""
@@ -197,6 +359,8 @@ IGNORE_SIGS_FILE=""    # set in init_ignore_sigs(); patterns (ERE, one per
                         # files for license protection, which structurally
                         # resembles webshell obfuscation to generic YARA
                         # heuristics). Same idea as LMD's ignore_sigs.
+GENERIC_OBFUSCATION_RULES_FILE=""  # see init_vendor_obfuscation_allowlist
+KNOWN_VENDOR_OBFUSCATION_FILE=""   # see init_vendor_obfuscation_allowlist
 EXCLUDE_PATHS=()        # -X/--exclude PATH (repeatable): extra paths/dirs
                         # to skip. Always ALSO includes the scanner's own
                         # install dir, signature dir, quarantine dir, and
@@ -208,6 +372,30 @@ EXCLUDE_PATHS=()        # -X/--exclude PATH (repeatable): extra paths/dirs
                         # being searched for. See init_self_exclude().
 DO_UPDATE=false
 USE_RAM=true
+ARCHIVE_USE_RAM=true   # captured separately from USE_RAM — see comment
+                        # where it's set, in init_workers()
+SIG_IN_RAM=false       # --sig-in-ram: force the COMPILED signature set
+                        # (sha256.tsv/md5.tsv/rules.yarc/mdb.tsv — can be
+                        # tens to a couple hundred MB for a real
+                        # ClamAV+Maldet+YARA-repo combined database) into
+                        # /dev/shm specifically, independent of the
+                        # general USE_RAM/low-RAM-profile decision that
+                        # governs the rest of WORK_DIR. Off by default —
+                        # the low-RAM-profile default (500MB ceiling)
+                        # already keeps normal runs modest on RAM; this is
+                        # an explicit opt-in for people running on boxes
+                        # with room to spare who want every batch's
+                        # hash/YARA lookup to be a guaranteed RAM hit
+                        # instead of hoping the OS page cache didn't get
+                        # evicted partway through a long scan.
+NO_RAM_EXPLICIT=""     # set when --no-ram is explicitly passed — the
+                        # low-RAM-profile auto-tuning below can force
+                        # USE_RAM=false on its own (default RAM ceiling is
+                        # 500MB, which trips that), but that heuristic is
+                        # about sizing the MAIN ephemeral WORK_DIR (which
+                        # scales with worker count) and shouldn't also
+                        # block the much smaller, independently-bounded
+                        # archive-RAM-extraction feature — see ARCHIVE_USE_RAM.
 ALLOW_BUSYBOX=true
 MB_KEY=""
 WORKERS=""            # empty = "auto", resolved in init_workers()
@@ -221,11 +409,44 @@ MAX_HEX_PATTERNS=8000 # cap on compiled hex_ere.txt entries, see compile_signatu
 BATCH_SIZE=200         # files per hash/YARA batch
 HEUR_BATCH_SIZE=200    # files per strings/hex heuristic batch
 PE_BATCH_SIZE=100      # files per PE-section (.mdb) batch
+SANDBOX_MODE="none"    # --sandbox-mode auto|bwrap|unshare|chroot|simple|none
+                        # — isolates archive EXTRACTION specifically (the
+                        # highest-risk operation: parsing an
+                        # attacker-controlled zip/tar/7z/rar). Off by
+                        # default; see MODULE: sandboxed extraction in the
+                        # worker for the actual implementation.
+SANDBOX_USER="nobody"
+SANDBOX_MEM_KB=1048576  # 1GB, simple mode only
+SANDBOX_CPU_SEC=60
+YARA_TIMEOUT_SEC=30    # --yara-timeout: abort a yara call after this many
+                        # seconds (yara's own -a flag) — a real scan can
+                        # otherwise hang indefinitely on a pathological
+                        # file/rule combination (reported in practice: a
+                        # live yara process sitting idle-looking but never
+                        # finishing on ordinary PHP/JS files). On a
+                        # timeout, the batch is retried file-by-file with a
+                        # much shorter per-file timeout to both salvage
+                        # results from the files that AREN'T the problem
+                        # and identify+report the one(s) that are.
+LONG_TIME_MODE=false    # -L/--long-time: log any SINGLE batch call that
+                        # takes longer than LONG_TIME_THRESHOLD_SEC (batch
+                        # type, elapsed time, exact file list) to the live
+                        # report — pure observability, no behavior change.
+                        # Pairs well with --yara-timeout for cases you
+                        # want to actively abort, or use alone just to
+                        # monitor "what's slow" without touching behavior.
+LONG_TIME_THRESHOLD_SEC=20
 SCAN_ARCHIVES=false     # -A/--scan-archives: opt-in (extraction has real
                         # cost and some risk — see MODULE: archive scanning)
 ARCHIVE_MAX_MB=200      # skip archives bigger than this (compressed size)
 ARCHIVE_MAX_EXTRACT_MB=500 # abort extraction past this much decompressed
                         # data — defense against decompression bombs
+ARCHIVE_RAM_MAX_MB=50   # extract archives up to this COMPRESSED size
+                        # straight into /dev/shm (RAM) — faster than disk,
+                        # especially on IOPS-capped hosts. Bigger archives
+                        # fall back to disk (still respects --no-ram /
+                        # /dev/shm free-space checks either way) to avoid
+                        # unbounded RAM pressure from one huge archive.
 ARCHIVE_MAX_DEPTH=2     # how many nested-archive levels to recurse into
 ARCHIVE_MAX_FILES=2000  # only scan the first N files inside one archive
 DO_SETUP=false         # --setup: build yara/yarac (and fetch busybox) then exit
@@ -248,6 +469,37 @@ WATCH_INTERVAL=5
 REALTIME_FIFO=""
 REALTIME_WORKER_PID=""
 REALTIME_REPORT=""
+LOW_PRIORITY=false     # --low-priority: run as unobtrusively as possible
+                        # (nice + ionice, fewer workers unless -j overrides)
+WORKERS_EXPLICIT=""    # set to 1 if -j/--workers was explicitly passed
+INCREMENTAL_MODE=false # -I/--incremental, also auto-enabled for -w unless
+                        # --no-incremental explicitly says otherwise — see
+                        # MODULE: incremental scan cache
+INCREMENTAL_EXPLICIT_OFF=""
+INCREMENTAL_CACHE_FILE=""  # default set in init_incremental_cache()
+SKIPPED_UNCHANGED=0     # files skipped this run because the cache says
+                        # they're unchanged since they were last found clean
+SUID_VERIFY_MODE=false  # dpkg/rpm package-checksum verification for
+                        # SUID/SGID files — auto-on for -w, or explicitly
+                        # via --verify-suid / --deep for a one-off scan.
+                        # Its value is catching a system binary being
+                        # SWAPPED, which mattered most for continuous
+                        # monitoring when this was designed — but hosting
+                        # audits usually run a one-off scan wanting MAXIMUM
+                        # thoroughness, not the fast default, so it's easy
+                        # to opt into without needing -w just for this.
+SUID_VERIFY_EXPLICIT_OFF=""
+DEEP_MODE=false         # --deep/--paranoid: convenience umbrella for a
+                        # one-off scan that wants -w's extra scrutiny
+                        # (SUID/SGID package verification, archive
+                        # scanning) without actually running in real-time
+                        # mode — see parse_args for exactly what it sets.
+                        # ALSO bypasses every automatic suppression
+                        # mechanism (ignore_sigs, vendor-obfuscation
+                        # allowlist, incremental cache skip) — the whole
+                        # point of a deep pass is maximum precision with
+                        # no exclusions at all; the person reviews and
+                        # dismisses findings themselves, not the tool.
 REALTIME_TAIL_PID=""
 
 # --- Platform (filled by detect_platform) ---
@@ -262,6 +514,7 @@ STRINGS_CMD="bash"
 FILE_CMD="bash"
 SHA256_CMD="none"
 MD5_CMD="none"
+SHA1_CMD="none"
 YARA_CMD="none"
 YARAC_BIN=""           # path to yarac (compile-time only; empty = not found
 GREP_BIN=""            # bundled static grep (bin/grep, see --setup); empty
@@ -282,6 +535,15 @@ ELAPSED_S=0
 TOTAL_FILES=0
 WORKER_PIDS=()
 MONITOR_PID=""
+HAS_SETSID=false       # set once in launch_workers()/start_realtime_worker()
+                        # — controls whether cleanup() can safely kill each
+                        # worker's WHOLE PROCESS GROUP (needed to also kill
+                        # a yara/grep/etc subprocess currently running
+                        # INSIDE a worker when the worker itself gets
+                        # killed — plain `kill $worker_pid` only kills the
+                        # worker's own PID, not its in-flight children,
+                        # which is exactly what orphaned them running
+                        # unkillable in the background after Ctrl+C).
 TF=0            # files scanned (total across workers)
 TT=0            # threats found (total across workers)
 QC=0            # quarantined (total across workers)
@@ -292,6 +554,15 @@ RPT=""          # final report text
 # ============================================================================
 # 2. MODULE: platform / cpu
 # ============================================================================
+#__SETUP_MODULE_START__
+# Everything from here through the end of run_self_setup() is the
+# self-contained BOOTSTRAP module: platform detection, busybox
+# acquisition, and building yara/grep/bash from source. Marked off so it
+# can be extracted to its own file (see extract_setup_module below) and
+# run/debugged in isolation — the explicit design goal being "should work
+# almost anywhere: needs only a filesystem and a kernel, and if the
+# system's own tools are compromised or missing, build known-good
+# replacements from source rather than trusting whatever's already there."
 detect_platform() {
     case "$(uname -s 2>/dev/null)" in
         Darwin) OS="macos" ;;
@@ -486,18 +757,39 @@ bb() {
 #    self-contained dd+od based detector.
 # ============================================================================
 detect_sha256() {
-    if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet sha256sum; then echo "$BUSYBOX_BIN sha256sum"
-    elif command -v sha256sum &>/dev/null; then echo "sha256sum"
+    # FIX (real bottleneck found and measured): busybox's sha256sum is
+    # ~1.8x slower than a real coreutils sha256sum on realistic file sizes
+    # (confirmed: 340ms vs 188ms hashing 200 files). Combined with the
+    # grep lookup fix below, this was the dominant cost in a real scan
+    # (hash= was 69% of total time). Same reasoning as bundling a real
+    # grep: prefer a known-fast implementation, busybox only as fallback
+    # for portability when nothing else is available.
+    if command -v sha256sum &>/dev/null; then echo "sha256sum"
+    elif [ -n "$BUSYBOX_BIN" ] && busybox_has_applet sha256sum; then echo "$BUSYBOX_BIN sha256sum"
     elif command -v shasum &>/dev/null; then echo "shasum -a 256"
     elif command -v openssl &>/dev/null; then echo "openssl dgst -sha256"
     else echo "none"; fi
 }
 
 detect_md5() {
-    if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet md5sum; then echo "$BUSYBOX_BIN md5sum"
-    elif command -v md5sum &>/dev/null; then echo "md5sum"
+    if command -v md5sum &>/dev/null; then echo "md5sum"
+    elif [ -n "$BUSYBOX_BIN" ] && busybox_has_applet md5sum; then echo "$BUSYBOX_BIN md5sum"
     elif command -v md5 &>/dev/null; then echo "md5 -q"
     elif command -v openssl &>/dev/null; then echo "openssl dgst -md5"
+    else echo "none"; fi
+}
+
+detect_sha1() {
+    # SHA1 support recovers a real, previously-silent gap: ClamAV's .hsb
+    # signature format (same field layout as .hdb: hash:size:name) can
+    # contain SHA1 hashes (40 hex chars) alongside MD5/SHA256 — our
+    # parser used to only recognize 32 and 64-char hashes, so every SHA1
+    # entry in a real daily.hsb/main.hsb was silently dropped, not just
+    # skipped-with-a-warning.
+    if command -v sha1sum &>/dev/null; then echo "sha1sum"
+    elif [ -n "$BUSYBOX_BIN" ] && busybox_has_applet sha1sum; then echo "$BUSYBOX_BIN sha1sum"
+    elif command -v shasum &>/dev/null; then echo "shasum -a 1"
+    elif command -v openssl &>/dev/null; then echo "openssl dgst -sha1"
     else echo "none"; fi
 }
 
@@ -533,6 +825,7 @@ init_toolchain() {
 
     SHA256_CMD=$(detect_sha256)
     MD5_CMD=$(detect_md5)
+    SHA1_CMD=$(detect_sha1)
 
     if [ -n "$BUSYBOX_BIN" ] && busybox_has_applet strings; then
         STRINGS_CMD="$BUSYBOX_BIN strings"; echo -e "${G}[OK] strings : busybox${Z}"
@@ -851,6 +1144,92 @@ build_grep_from_source() {
     return 0
 }
 
+# Builds a fully static bash from source — same reasoning as grep/yara
+# (guaranteed known-good behavior, no dependency on whatever's on the
+# host), but with an ADDITIONAL, distinct motivation: a rootkit that
+# patches system binaries (classic technique — Diamorphine, t0rn-style,
+# LD_PRELOAD hooking) very often includes /bin/bash itself among the
+# tools it tampers with, since bash is what most admin tooling (including
+# this scanner) runs through. Re-exec'ing early into a bundled, verified
+# bash (see the re-exec check near the top of main()) narrows how much of
+# the scan ever touches a potentially-compromised interpreter.
+#
+# HONEST LIMIT: this does NOT fully solve the problem. If the shell that
+# runs THIS SPECIFIC INVOCATION (before the re-exec check even executes)
+# is itself compromised, that first fraction of a second of execution is
+# still exposed — no script can fully bootstrap trust in its own
+# interpreter from within that same interpreter. The real protection
+# comes from copying av.sh + bin/bash from a KNOWN-CLEAN source and
+# invoking "./bin/bash ./av.sh" directly, never touching system bash at
+# all. The re-exec is a narrowing of exposure for the common case (person
+# just runs "bash av.sh" or "./av.sh"), not a full guarantee.
+build_bash_from_source() {
+    local version="${SETUP_BASH_VERSION:-5.2.21}"
+
+    if [ -x "$SCRIPT_DIR/bin/bash" ] && [ "${SETUP_FORCE:-false}" != true ]; then
+        echo -e "${G}[OK] bin/bash already present -> nothing to do${Z}"
+        return 0
+    fi
+
+    if [ "$(id -u 2>/dev/null)" != "0" ] && ! command -v sudo &>/dev/null; then
+        echo -e "${R}[FAIL] Need root or sudo to install build dependencies${Z}"
+        return 1
+    fi
+    local as_root=""
+    [ "$(id -u 2>/dev/null)" != "0" ] && as_root="sudo"
+    _install_build_toolchain "$as_root" || return 1
+
+    local workdir
+    workdir=$(mktemp -d 2>/dev/null) || { echo -e "${R}[FAIL] mktemp failed${Z}"; return 1; }
+    echo "[*] Downloading GNU bash v${version} source..."
+    local bash_urls=(
+        "https://ftp.gnu.org/gnu/bash/bash-${version}.tar.gz"
+        "https://mirror.team-cymru.com/gnu/bash/bash-${version}.tar.gz"
+        "https://mirrors.kernel.org/gnu/bash/bash-${version}.tar.gz"
+        "https://ftpmirror.gnu.org/bash/bash-${version}.tar.gz"
+    )
+    local fetched=false burl
+    for burl in "${bash_urls[@]}"; do
+        if net_fetch "$burl" "$workdir/bash.tar.gz" 30; then
+            fetched=true
+            break
+        fi
+    done
+    if [ "$fetched" != true ]; then
+        echo -e "${R}[FAIL] Could not download bash source from any mirror (network?)${Z}"
+        rm -rf "$workdir"
+        return 1
+    fi
+    tar -xzf "$workdir/bash.tar.gz" -C "$workdir" || { echo -e "${R}[FAIL] Corrupt download${Z}"; rm -rf "$workdir"; return 1; }
+
+    (
+        cd "$workdir/bash-${version}" || exit 1
+        echo "[*] Configuring (static link, no NLS — smaller, fewer moving parts)..."
+        ./configure --enable-static-link --disable-nls --without-bash-malloc LDFLAGS="-static" \
+            >/tmp/av_bash_setup_configure.log 2>&1 || exit 1
+        echo "[*] Building..."
+        make -j"$(nproc 2>/dev/null || echo 2)" >/tmp/av_bash_setup_make.log 2>&1 || exit 1
+        strip ./bash 2>/dev/null || true
+    )
+    local build_rc=$?
+
+    if [ $build_rc -ne 0 ] || [ ! -x "$workdir/bash-${version}/bash" ]; then
+        echo -e "${R}[FAIL] Build failed — see /tmp/av_bash_setup_configure.log and /tmp/av_bash_setup_make.log${Z}"
+        rm -rf "$workdir"
+        return 1
+    fi
+
+    mkdir -p "$SCRIPT_DIR/bin"
+    cp "$workdir/bash-${version}/bash" "$SCRIPT_DIR/bin/bash"
+    chmod +x "$SCRIPT_DIR/bin/bash"
+    rm -rf "$workdir"
+
+    echo -e "${G}[OK] Built: $SCRIPT_DIR/bin/bash${Z}"
+    "$SCRIPT_DIR/bin/bash" --version | head -1
+    echo "     Dependencies: $(ldd "$SCRIPT_DIR/bin/bash" 2>&1 | head -1)"
+    return 0
+}
+
 run_self_setup() {
     echo -e "${B}=== av_scan.sh self-setup ===${Z}"
     echo "Target: $SCRIPT_DIR/bin/{yara,yarac,grep}"
@@ -870,6 +1249,9 @@ run_self_setup() {
     echo ""
     build_grep_from_source
 
+    echo ""
+    build_bash_from_source
+
     # busybox too, while we're setting things up, if it isn't there yet.
     if [ ! -x "$SCRIPT_DIR/bin/busybox" ]; then
         echo ""
@@ -882,6 +1264,7 @@ run_self_setup() {
     echo -e "${G}[OK] Setup complete.${Z} Re-run $0 --help to confirm dependency status."
     return 0
 }
+#__SETUP_MODULE_END__
 
 
 parse_args() {
@@ -889,8 +1272,8 @@ parse_args() {
         case "$1" in
             -u|--update)     DO_UPDATE=true; shift ;;
             -r|--max-ram)    MAX_RAM_MB="$2"; shift 2 ;;
-            -j|--workers)    WORKERS="$2"; shift 2 ;;
-            -d|--dir)        ROOT_DIR="$2"; shift 2 ;;
+            -j|--workers)    WORKERS="$2"; WORKERS_EXPLICIT=1; shift 2 ;;
+            -d|--dir)        ROOT_DIR="$2"; ROOT_DIR_EXPLICIT=1; shift 2 ;;
             -s|--sigs)       SIGNATURES="$2"; shift 2 ;;
             -m|--max-size)   MAX_SCAN_MB="$2"; shift 2 ;;
             -o|--output)     OUTPUT_FILE="$2"; shift 2 ;;
@@ -898,10 +1281,20 @@ parse_args() {
             -X|--exclude)    EXCLUDE_PATHS+=("$2"); shift 2 ;;
             -A|--scan-archives)  SCAN_ARCHIVES=true; shift ;;
             --archive-max-mb)         ARCHIVE_MAX_MB="$2"; shift 2 ;;
+            --archive-ram-max-mb)     ARCHIVE_RAM_MAX_MB="$2"; shift 2 ;;
             --archive-max-extract-mb) ARCHIVE_MAX_EXTRACT_MB="$2"; shift 2 ;;
             --archive-max-depth)      ARCHIVE_MAX_DEPTH="$2"; shift 2 ;;
             --archive-max-files)      ARCHIVE_MAX_FILES="$2"; shift 2 ;;
-            --no-ram)        USE_RAM=false; shift ;;
+            --yara-timeout)           YARA_TIMEOUT_SEC="$2"; shift 2 ;;
+            --sandbox-mode)  SANDBOX_MODE="$2"; shift 2 ;;
+            -P|--scan-processes) SCAN_PROCESSES=true; shift ;;
+            -K|--check-kernel)   CHECK_KERNEL=true; shift ;;
+            --offline-root)      OFFLINE_ROOT="$2"; shift 2 ;;
+            --sig-in-ram)        SIG_IN_RAM=true; shift ;;
+            --deep|--paranoid)   SUID_VERIFY_MODE=true; SCAN_ARCHIVES=true; DEEP_MODE=true; shift ;;
+            -L|--long-time)  LONG_TIME_MODE=true; shift ;;
+            --long-time-threshold)    LONG_TIME_THRESHOLD_SEC="$2"; shift 2 ;;
+            --no-ram)        USE_RAM=false; NO_RAM_EXPLICIT=1; shift ;;
             --no-busybox)    ALLOW_BUSYBOX=false; shift ;;
             -b|--busybox)    BUSYBOX_PATH_ARG="$2"; shift 2 ;;
             --busybox-url)   BUSYBOX_URL_ARG="$2"; shift 2 ;;
@@ -911,6 +1304,12 @@ parse_args() {
             --quarantine-dir)  QUARANTINE_ENABLED=true; QUARANTINE_DIR="$2"; shift 2 ;;
             --quarantine-perm) QUARANTINE_PERM="$2"; shift 2 ;;
             -w|--real-time|--realtime) REALTIME_MODE=true; shift ;;
+            --low-priority|--background|--bg) LOW_PRIORITY=true; shift ;;
+            -I|--incremental)  INCREMENTAL_MODE=true; shift ;;
+            --no-incremental)  INCREMENTAL_MODE=false; INCREMENTAL_EXPLICIT_OFF=1; shift ;;
+            --verify-suid)     SUID_VERIFY_MODE=true; shift ;;
+            --no-verify-suid)  SUID_VERIFY_MODE=false; SUID_VERIFY_EXPLICIT_OFF=1; shift ;;
+            --incremental-cache) INCREMENTAL_CACHE_FILE="$2"; shift 2 ;;
             --watch-interval)  WATCH_INTERVAL="$2"; shift 2 ;;
             --max-hex-patterns) MAX_HEX_PATTERNS="$2"; shift 2 ;;
             --batch-size)    BATCH_SIZE="$2"; shift 2 ;;
@@ -936,6 +1335,24 @@ setup_colors() {
 # ============================================================================
 # 6. MODULE: worker sizing / RAM guard
 # ============================================================================
+# --low-priority: renice + ionice the CURRENT process (this main script) —
+# children (workers) forked afterward inherit both the nice value and the
+# ionice class/priority automatically on Linux, so this one call covers
+# the whole process tree without needing to wrap every worker launch.
+# Best-effort: missing `ionice` (non-Linux, minimal container) or lack of
+# permission to renice just means one less lever pulled, not a failure.
+apply_low_priority() {
+    [ "$LOW_PRIORITY" = true ] || return 0
+    echo -e "${C}[*] --low-priority: reducing CPU/IO priority to stay out of the way${Z}"
+    renice -n 19 -p $$ &>/dev/null || true
+    if command -v ionice &>/dev/null; then
+        # Class 3 = idle: only gets disk I/O when nothing else wants it.
+        # Falls back to best-effort class 2 at the lowest priority (7) on
+        # kernels/schedulers where idle I/O class isn't available.
+        ionice -c 3 -p $$ &>/dev/null || ionice -c 2 -n 7 -p $$ &>/dev/null || true
+    fi
+}
+
 init_workers() {
     # WORKERS may be set via -j/--workers; otherwise auto by CPU count.
     [ -z "$WORKERS" ] && WORKERS=$(cpu_count)
@@ -945,6 +1362,15 @@ init_workers() {
         ''|*[!0-9]*) WORKERS=$(cpu_count) ;;
     esac
     [ "${WORKERS:-0}" -ge 1 ] 2>/dev/null || WORKERS=1
+
+    # --low-priority: default to a single worker unless the person
+    # explicitly asked for more via -j — the whole point is to stay out
+    # of the way of everything else running on the box, and running
+    # several workers in parallel (even niced/ionice'd) still competes for
+    # the same disk/IOPS budget as a single one, just faster and busier.
+    if [ "$LOW_PRIORITY" = true ] && [ -z "$WORKERS_EXPLICIT" ]; then
+        WORKERS=1
+    fi
 
     echo -e "${B}[*] RAM Guard: ceiling ${C}${MAX_RAM_MB} MB${Z}"
 
@@ -957,6 +1383,14 @@ init_workers() {
             WORKERS=$max_safe
         fi
     fi
+
+    # Capture the person's ORIGINAL --no-ram preference for archive
+    # extraction BEFORE the low-RAM-profile auto-tuning below can
+    # override USE_RAM — archive RAM extraction is independently bounded
+    # by ARCHIVE_RAM_MAX_MB (default 50MB, tiny compared to a worker's own
+    # RAM ceiling) and shouldn't be silently disabled just because the
+    # overall RAM ceiling looks modest.
+    ARCHIVE_USE_RAM="$USE_RAM"
 
     if [ "$MAX_RAM_MB" -le 512 ]; then
         USE_RAM=false
@@ -1014,20 +1448,95 @@ init_ignore_sigs() {
 # Oprhus AV Scanner — ignore_sigs
 #
 # One extended-regex (ERE) pattern per line, matched against
-# "TYPE|info" of each detection (e.g. "YARA_MATCH|rule=WEBSHELL_PHP_Dynamic_Big"
-# or "SIG_STRING_MATCH|pattern=chmod 777"). A match SUPPRESSES that
-# detection entirely — no log entry, no quarantine. Patterns match as
-# substrings, so "WEBSHELL_PHP_Dynamic_Big" also matches
-# "WEBSHELL_PHP_Dynamic_Big_v2" — anchor with ^/$ for an exact match.
+# "TYPE|info|FILEPATH" of each detection, e.g.:
+#   YARA_MATCH|rule=WEBSHELL_PHP_Dynamic_Big|/home/site/upload/engine/init.php
+# A match SUPPRESSES that detection entirely — no log entry, no
+# quarantine. Patterns match as substrings anywhere on the line, so a
+# bare "rule=WEBSHELL_PHP_Dynamic_Big" suppresses that rule EVERYWHERE,
+# on every file, on every future scan — including a real webshell on some
+# other site that happens to trip the same rule. Prefer scoping to a path
+# too, e.g. "rule=WEBSHELL_PHP_Dynamic_Big.*/upload/engine/" only
+# suppresses it under that one directory, leaving the rule fully active
+# everywhere else.
 #
 # Use this for signatures/rules that are individually too broad for your
 # specific software (e.g. a CMS that ships obfuscated/encoded core files
 # for license protection — generic webshell-obfuscation heuristics can't
 # tell that apart from an actual backdoor by pattern alone).
 #
-# Examples (uncomment to use):
-# rule=WEBSHELL_PHP_Dynamic_Big
-# rule=WEBSHELL_PHP_Encoded_Big
+# Examples (uncomment / adapt the path to your actual install):
+# rule=WEBSHELL_PHP_Dynamic_Big.*/upload/engine/
+# rule=WEBSHELL_PHP_Encoded_Big.*/upload/engine/
+# rule=EXT_WEBSHELL_PHP_Generic.*/vendor/matomo/device-detector/README\.md
+EOF
+    fi
+}
+
+# Known-vendor-obfuscation allowlist: an ALTERNATIVE to path-based
+# ignore_sigs that works automatically on ANY install, no per-server path
+# configuration needed. If a file matches one of the "generic" YARA rules
+# in GENERIC_OBFUSCATION_RULES_FILE (broad obfuscation heuristics that
+# can't distinguish a real backdoor from a vendor protecting their own
+# code) AND the SAME file also contains one of the fingerprint strings in
+# KNOWN_VENDOR_OBFUSCATION_FILE (distinctive enough that a real attacker
+# copying it verbatim to impersonate the vendor would be an unusually
+# sophisticated, deliberate move, not a generic webshell), the detection
+# is suppressed automatically. Ships pre-populated with DataLife Engine's
+# own obfuscator fingerprint (confirmed from real samples: a
+# "DataLife Engine - by SoftNews Media Group" header combined with a
+# strrev('edoced_46esab') [= "base64_decode" reversed] decode wrapper) —
+# add more vendors' fingerprints here as you run into them.
+init_vendor_obfuscation_allowlist() {
+    [ -n "$GENERIC_OBFUSCATION_RULES_FILE" ] || GENERIC_OBFUSCATION_RULES_FILE="${SIGNATURES}/generic_obfuscation_rules"
+    [ -n "$KNOWN_VENDOR_OBFUSCATION_FILE" ] || KNOWN_VENDOR_OBFUSCATION_FILE="${SIGNATURES}/known_vendor_obfuscation"
+
+    if [ ! -f "$GENERIC_OBFUSCATION_RULES_FILE" ]; then
+        mkdir -p "$(dirname "$GENERIC_OBFUSCATION_RULES_FILE")" 2>/dev/null
+        cat << 'EOF' > "$GENERIC_OBFUSCATION_RULES_FILE" 2>/dev/null
+# Oprhus AV Scanner — generic_obfuscation_rules
+#
+# One ERE pattern per line, matched against a YARA rule NAME. These are
+# rules broad/generic enough ("does this look obfuscated at all") that
+# they can't tell a real backdoor apart from a vendor obfuscating their
+# OWN code (license protection etc) — a match against one of these rule
+# names is only auto-suppressed if the SAME file also matches a
+# fingerprint in known_vendor_obfuscation (both conditions required, not
+# either alone). Add more rule names here as you find other overly-broad
+# ones tripping on legitimate vendor code.
+^WEBSHELL_PHP_Dynamic_Big$
+^WEBSHELL_PHP_Encoded_Big$
+^EXT_WEBSHELL_PHP_Generic$
+^WEBSHELL_PHP_Generic_Eval$
+^WEBSHELL_PHP_OBFUSC_Encoded_Mixed_Dec_And_Hex$
+^WEBSHELL_PHP_OBFUSC_Fopo$
+^WEBSHELL_PHP_Gzinflated$
+EOF
+    fi
+
+    if [ ! -f "$KNOWN_VENDOR_OBFUSCATION_FILE" ]; then
+        mkdir -p "$(dirname "$KNOWN_VENDOR_OBFUSCATION_FILE")" 2>/dev/null
+        cat << 'EOF' > "$KNOWN_VENDOR_OBFUSCATION_FILE" 2>/dev/null
+# Oprhus AV Scanner — known_vendor_obfuscation
+#
+# One ERE pattern per line — a distinctive fingerprint of a SPECIFIC,
+# LEGITIMATE vendor's own code-obfuscation scheme (usually license
+# protection on core files, not malware). Only consulted for files that
+# ALSO matched a rule listed in generic_obfuscation_rules — this file
+# alone never suppresses anything by itself. Add a new line per vendor
+# you run into, ideally a string unlikely to appear by accident.
+#
+# NOTE: grep matches line-by-line — "." does NOT cross newlines here, so
+# a pattern spanning e.g. a header comment AND a decode call several
+# lines later (real files have a large base64 blob in between) will never
+# match. Keep each pattern to something that appears on ONE line.
+#
+# DataLife Engine (dle-news.ru) — confirmed from real obfuscated core
+# files: a "base64_decode" spelled backwards and un-reversed via strrev()
+# at decode time (a deliberate trick to dodge naive "eval(base64_decode"
+# string signatures — which is also exactly why our OWN eval(base64_decode
+# heuristic never caught it either, for what it's worth). Distinctive
+# enough on its own without needing to also match the header line.
+strrev\('edoced_46esab'\)
 EOF
     fi
 }
@@ -1058,6 +1567,11 @@ init_live_report() {
     } >> "$LIVE_REPORT_FILE" 2>/dev/null
 
     echo -e "${C}[*] Live threat log: ${LIVE_REPORT_FILE}${Z}"
+
+    if [ "$LONG_TIME_MODE" = true ]; then
+        : > "${LIVE_REPORT_FILE}.slow" 2>/dev/null
+        echo -e "${C}[*] Slow-batch log (-L): ${LIVE_REPORT_FILE}.slow — tail -f it to watch live${Z}"
+    fi
 }
 
 # ============================================================================
@@ -1410,10 +1924,29 @@ compile_signatures() {
     local cached_version=""
     [ -f "$version_flag" ] && cached_version=$(cat "$version_flag" 2>/dev/null)
 
-    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ "$compiled_flag" -nt "$sig_input" ] && [ "$cached_version" = "$VERSION" ]; then
+    # FIX (real bug reported): comparing against $sig_input's OWN top-level
+    # mtime is fragile — creating ANY new direct child inside it (e.g. an
+    # auto-created ignore_sigs or incremental-cache file the first time
+    # either feature runs) bumps that mtime, making a cache written
+    # SECONDS earlier look "stale" on the very next invocation even though
+    # no actual signature data changed (this is exactly what caused
+    # "-u finishes, cache is fresh, but the next plain scan recompiles
+    # everything anyway"). Compare against the newest mtime among the
+    # REAL signature source files instead (excluding .cache/ itself and
+    # our own auxiliary state files) — semantically correct (what we
+    # actually care about IS whether any signature content changed) and
+    # immune to unrelated files appearing alongside it.
+    local newest_src=""
+    if [ -d "$sig_input" ]; then
+        newest_src=$(bb find "$sig_input" -mindepth 1 -not -path '*/.cache/*' \
+            -not -name "ignore_sigs" -not -name ".incremental_cache.tsv" \
+            -newer "$compiled_flag" -print -quit 2>/dev/null)
+    fi
+
+    if [ "$DO_UPDATE" != true ] && [ -f "$compiled_flag" ] && [ -z "$newest_src" ] && [ "$cached_version" = "$VERSION" ]; then
         echo -e "[*] Signatures already compiled -> reusing cache ($cache_dir)"
         mkdir -p "$out_dir"
-        cp -f "$cache_dir"/sha256.tsv "$cache_dir"/md5.tsv "$cache_dir"/hex_ere.txt \
+        cp -f "$cache_dir"/sha256.tsv "$cache_dir"/sha1.tsv "$cache_dir"/md5.tsv "$cache_dir"/hex_ere.txt \
               "$cache_dir"/strings.txt "$cache_dir"/b64_payloads.tsv "$cache_dir"/mdb.tsv \
               "$cache_dir"/str_sig_map.tsv "$out_dir/" 2>/dev/null || true
         [ -d "$cache_dir/yara" ] && cp -rf "$cache_dir/yara" "$out_dir/" 2>/dev/null
@@ -1650,6 +2183,7 @@ EOF
                 h = tolower(a[1])
                 name = (n >= 3 ? a[3] : "ClamAV.Hash")
                 if (h ~ /^[0-9a-f]{64}$/) print "SHA256\t" h "\t" name
+                else if (h ~ /^[0-9a-f]{40}$/) print "SHA1\t" h "\t" name
                 else if (h ~ /^[0-9a-f]{32}$/) print "MD5\t" h "\t" name
             }
         '
@@ -1842,6 +2376,7 @@ EOF
         # Distribute the merged processed stream into the .tsv/.txt/.yar outputs
         bb awk -F'\t' -v out="$out_dir" '
             $1 == "SHA256"   { print $2 "\t" $3 >> (out "/sha256.tsv") }
+            $1 == "SHA1"     { print $2 "\t" $3 >> (out "/sha1.tsv") }
             $1 == "MD5"      { print $2 "\t" $3 >> (out "/md5.tsv") }
             $1 == "STR"      { print $2 >> (out "/strings.txt") }
             $1 == "B64"      { print $2 "\t" $3 >> (out "/b64_payloads.tsv") }
@@ -1889,6 +2424,7 @@ EOF
     # depth alongside the explicit 0-byte skip in the scan paths.
     local empty_md5="d41d8cd98f00b204e9800998ecf8427e"
     local empty_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    local empty_sha1="da39a3ee5e6b4b0d3255bfef95601890afd80709"
     # NOTE: grep -v exits 1 (not an error) when it filters out EVERY line —
     # a plain "&&" chain would then skip the mv and leave the bad entry in
     # place, so the mv runs unconditionally after grep regardless of its
@@ -1900,6 +2436,10 @@ EOF
     if [ -s "$out_dir/sha256.tsv" ]; then
         bb grep -v "^${empty_sha256}" "$out_dir/sha256.tsv" > "$out_dir/sha256.tsv.tmp" 2>/dev/null
         mv -f "$out_dir/sha256.tsv.tmp" "$out_dir/sha256.tsv" 2>/dev/null
+    fi
+    if [ -s "$out_dir/sha1.tsv" ]; then
+        bb grep -v "^${empty_sha1}" "$out_dir/sha1.tsv" > "$out_dir/sha1.tsv.tmp" 2>/dev/null
+        mv -f "$out_dir/sha1.tsv.tmp" "$out_dir/sha1.tsv" 2>/dev/null
     fi
 
     # Strip known-overbroad string patterns regardless of source (our own
@@ -1958,24 +2498,22 @@ EOF
         ' "$out_dir/strings.txt"
     fi
 
-    # Base64-payload SCREENING also folded into the same YARA pass — this
-    # was a separate `grep -oE` full-file read on EVERY scanned file
-    # before, regardless of whether it actually contained anything
-    # base64-looking (which most files don't). Reserved rule name
-    # "__av_b64_screen__": when it fires, the worker does the (much rarer)
-    # decode+magic-check+hash-lookup follow-up ONLY for that file, instead
-    # of scanning every file's content separately. Directly reduces total
-    # disk reads per scan, which matters most on I/O/IOPS-constrained
-    # hosts where reducing fork/process count alone stops helping once
-    # disk throughput, not CPU, is the ceiling.
-    cat << 'EOF' > "$out_dir/yara/generated_b64_screen.yar"
-rule __av_b64_screen__ {
-    strings:
-        $s = /[A-Za-z0-9+\/]{200,}={0,2}/
-    condition:
-        $s
-}
-EOF
+    # REVERTED (real regression reported): base64-payload screening used
+    # to be folded into this same YARA pass via a reserved
+    # "__av_av_b64_screen__" regex rule, to save one full-file read per
+    # scanned file (an IOPS optimization). In practice, on real DLE
+    # installations, this made specific files take 74-113+ SECONDS EACH —
+    # confirmed to be exactly DLE's own license-obfuscated engine files,
+    # which are (by design) one enormous single-line base64-ish blob.
+    # YARA's regex engine scales badly against that shape of content with
+    # an unbounded {200,} quantifier, in a way a plain `grep -oE` call
+    # (the original, pre-YARA implementation) did not — confirmed by the
+    # person: the exact same files processed correctly and faster before
+    # this optimization. Reliability beats a marginal IOPS win here, so
+    # base64 screening is back to being its own grep pass (see
+    # check_file_heuristics -> _check_b64_payload in the worker) — no
+    # generated_b64_screen.yar, no "__av_b64_screen__" rule anymore.
+    rm -f "$out_dir/yara/generated_b64_screen.yar" 2>/dev/null
 
     # YARA: gather external rule sources (fetched during -u) plus our own
     # generated NDB/LDB/string rules, and compile them ALL into one
@@ -2057,7 +2595,7 @@ EOF
 
     # Dedup (also collapses now-common ".*"-only variants of what used to be
     # distinct bounded-quantifier patterns)
-    for f in sha256.tsv md5.tsv strings.txt b64_payloads.tsv hex_ere.txt mdb.tsv; do
+    for f in sha256.tsv sha1.tsv md5.tsv strings.txt b64_payloads.tsv hex_ere.txt mdb.tsv; do
         [ -s "$out_dir/$f" ] && bb sort -u "$out_dir/$f" -o "$out_dir/$f" 2>/dev/null || true
     done
 
@@ -2077,8 +2615,16 @@ EOF
 
     # Save compiled artifacts to the persistent cache so the next run can
     # reuse them without recompiling (see comment at the top of this function)
+    #
+    # FIX (real bug found): cp -rf only overwrites files that exist in the
+    # FRESH out_dir/yara — it doesn't delete stray old files already
+    # sitting in cache_dir/yara that aren't part of this compile (e.g. a
+    # generated_b64_screen.yar left over from a previous script version
+    # that no longer generates one at all). rm -rf the cache's yara/ dir
+    # first so a recompile can't leave stale artifacts behind.
     mkdir -p "$cache_dir"
-    cp -f "$out_dir"/sha256.tsv "$out_dir"/md5.tsv "$out_dir"/hex_ere.txt \
+    rm -rf "$cache_dir/yara" 2>/dev/null
+    cp -f "$out_dir"/sha256.tsv "$out_dir"/sha1.tsv "$out_dir"/md5.tsv "$out_dir"/hex_ere.txt \
           "$out_dir"/strings.txt "$out_dir"/b64_payloads.tsv "$out_dir"/mdb.tsv \
           "$out_dir"/str_sig_map.tsv "$cache_dir/" 2>/dev/null || true
     [ -d "$out_dir/yara" ] && cp -rf "$out_dir/yara" "$cache_dir/" 2>/dev/null
@@ -2086,6 +2632,7 @@ EOF
     printf '%s' "$VERSION" > "$version_flag" 2>/dev/null || true
 
     echo -e "  SHA256 : ${C}$(bb wc -l < "$out_dir/sha256.tsv" 2>/dev/null | tr -d ' ')${Z}"
+    echo -e "  SHA1   : ${C}$(bb wc -l < "$out_dir/sha1.tsv" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  MD5    : ${C}$(bb wc -l < "$out_dir/md5.tsv" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  PE Sections (mdb): ${C}$(bb wc -l < "$out_dir/mdb.tsv" 2>/dev/null | tr -d ' ')${Z}"
     echo -e "  HexERE : ${C}$(bb wc -l < "$out_dir/hex_ere.txt" 2>/dev/null | tr -d ' ')${Z}"
@@ -2112,7 +2659,24 @@ choose_work_dir() {
 init_workdir() {
     WORK_DIR=$(choose_work_dir "$USE_RAM" "$WORKERS")
     WORKER_FILE="$WORK_DIR/worker.sh"
-    SIG_DIR="$WORK_DIR/sigs"
+
+    if [ "$SIG_IN_RAM" = true ] && [ "$OS" = "linux" ] && [ -d /dev/shm ]; then
+        # Independent of WORK_DIR's own placement (see SIG_IN_RAM global
+        # comment) — needs its own free-space check since a real combined
+        # ClamAV+Maldet+YARA-repo database's compiled form (sha256.tsv/
+        # md5.tsv/mdb.tsv/rules.yarc) can run into the hundreds of MB.
+        local sig_needed=300 sig_avail
+        sig_avail=$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
+        if [ "${sig_avail:-0}" -ge "$sig_needed" ]; then
+            SIG_DIR="/dev/shm/av_sigs_$$"
+        else
+            echo -e "${Y}[WARN] --sig-in-ram requested but /dev/shm doesn't have enough free space (need ~${sig_needed}MB, have ${sig_avail:-0}MB) -> falling back to normal placement${Z}"
+            SIG_DIR="$WORK_DIR/sigs"
+        fi
+    else
+        SIG_DIR="$WORK_DIR/sigs"
+    fi
+
     mkdir -p "$WORK_DIR/reports" "$SIG_DIR"
 }
 
@@ -2124,6 +2688,251 @@ extract_worker() {
         $inside && printf '%s\n' "$ln"
     done < "$0" > "$WORKER_FILE"
     chmod +x "$WORKER_FILE"
+}
+
+# Pulls the bootstrap/setup module (detect_platform through run_self_setup
+# — see #__SETUP_MODULE_START__/_END__ markers) out into its own runnable
+# script, same technique as extract_worker() above. Written to a
+# PERSISTENT location next to this script (not the ephemeral WORK_DIR
+# used for scan runs) specifically so it stays around afterward for
+# independent debugging: edit it, re-run it directly with plain
+# `bash setup_module.sh --setup [--force]`, without needing to invoke the
+# whole scanner or touch any scan-related code at all.
+extract_setup_module() {
+    local target="${1:-$SCRIPT_DIR/setup_module.sh}"
+    {
+        echo '#!/bin/bash'
+        echo '# Auto-extracted bootstrap/setup module — see av.sh for the source of'
+        echo '# truth (#__SETUP_MODULE_START__/_END__ markers). Safe to run standalone:'
+        echo '#   bash setup_module.sh --setup [--force]'
+        echo 'SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"'
+        echo 'R="" G="" Y="" C="" B="" Z=""'
+        echo '[ -t 1 ] && { R="\033[0;31m"; Y="\033[1;33m"; G="\033[0;32m"; C="\033[0;36m"; B="\033[1m"; Z="\033[0m"; }'
+        echo 'YARA_URL_ARG="${YARA_URL_ARG:-}"'
+        echo 'SETUP_FORCE="${SETUP_FORCE:-false}"'
+        echo 'SETUP_COMPILE_ONLY="${SETUP_COMPILE_ONLY:-false}"'
+        echo 'BUSYBOX_BIN="${BUSYBOX_BIN:-}"'
+        echo 'ALLOW_BUSYBOX="${ALLOW_BUSYBOX:-true}"'
+        echo 'OS=""; ARCH=""'
+        local inside=false
+        while IFS= read -r ln; do
+            [ "$ln" = "#__SETUP_MODULE_START__" ] && { inside=true; continue; }
+            [ "$ln" = "#__SETUP_MODULE_END__" ] && break
+            $inside && printf '%s\n' "$ln"
+        done < "$0"
+        echo ''
+        echo 'detect_platform'
+        echo 'case "$1" in --force) SETUP_FORCE=true ;; esac'
+        echo 'run_self_setup'
+    } > "$target"
+    chmod +x "$target"
+}
+
+# ============================================================================
+# MODULE: process/memory anomaly scanning (-P/--scan-processes)
+#
+# Addresses a specific, real gap in pure file-tree scanning: a process can
+# keep running after its own backing executable is deleted from disk (the
+# kernel keeps the inode open as long as something references it) — the
+# exact "видаляє процес й лишається тільки в ОЗУ" scenario. A file-based
+# scanner alone can NEVER see this, no matter how good its signatures are,
+# since there's no file left to check.
+#
+# HONEST SCOPE — stated plainly, not just implied: this catches simple,
+# common rootkit techniques (deleted binaries, ps/proc hiding via
+# userspace hooks, LD_PRELOAD injection). It does NOT and CANNOT reliably
+# catch a genuine kernel-level (LKM) rootkit — one that patches the
+# kernel itself can lie to /proc, ps, and every other userspace tool
+# equally, INCLUDING this one, since we go through the exact same syscalls
+# everything else does. Real detection at that level needs analysis from
+# OUTSIDE the running kernel (offline disk/memory forensics), which is a
+# fundamentally different tool than a bash-based file/process scanner.
+# This module is a real, useful net for the common case, not a guarantee.
+# ============================================================================
+SCAN_PROCESSES=false   # -P/--scan-processes
+
+scan_processes() {
+    echo -e "${B}[*] Scanning running processes for rootkit indicators...${Z}"
+    [ -d /proc ] || { echo -e "${Y}[WARN] /proc not available -> skipping process scan${Z}"; return; }
+
+    local pid_dir pid exe_link cmdline found=0
+
+    # --- 1. Deleted-binary check + known-malware hash check for live exes ---
+    # Reuses the ALREADY-COMPILED hash database (same sha256.tsv/md5.tsv
+    # the file scan uses) — a process running a KNOWN-BAD binary gets
+    # caught the same way a file would, just read from /proc/PID/exe
+    # instead of a path on the tree.
+    local has_hash_db=false
+    [ -s "$SIG_DIR/sha256.tsv" ] && has_hash_db=true
+
+    for pid_dir in /proc/[0-9]*; do
+        pid="${pid_dir#/proc/}"
+        [ -r "$pid_dir/exe" ] || continue
+        exe_link=$(readlink "$pid_dir/exe" 2>/dev/null)
+        [ -z "$exe_link" ] && continue
+        cmdline=$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null | head -c 150)
+
+        case "$exe_link" in
+            *" (deleted)")
+                local real_path="${exe_link% (deleted)}"
+                echo -e "${R}[!] [PROCESS_DELETED_BINARY] PID=${pid} exe=${real_path} cmdline=${cmdline}${Z}"
+                found=$(( found + 1 ))
+                ;;
+            *)
+                if [ "$has_hash_db" = true ] && [ -r "$pid_dir/exe" ]; then
+                    local h
+                    h=$($SHA256_CMD "$pid_dir/exe" 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1)
+                    if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/sha256.tsv" 2>/dev/null; then
+                        local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/sha256.tsv" | cut -f2)
+                        echo -e "${R}[!] [PROCESS_KNOWN_MALWARE] PID=${pid} exe=${exe_link} name=${n:-Malware} cmdline=${cmdline}${Z}"
+                        found=$(( found + 1 ))
+                    fi
+                fi
+                ;;
+        esac
+
+        # LD_PRELOAD is the classic userspace hooking-rootkit technique
+        # (intercepting libc calls like readdir/stat to hide files or
+        # processes) — a process running with it set is at minimum worth
+        # a look, even though plenty of legitimate tools use it too
+        # (this is a LEAD to check, not proof by itself).
+        if [ -r "$pid_dir/environ" ]; then
+            local preload
+            preload=$(tr '\0' '\n' < "$pid_dir/environ" 2>/dev/null | bb grep "^LD_PRELOAD=" | head -1)
+            if [ -n "$preload" ]; then
+                echo -e "${Y}[!] [PROCESS_LD_PRELOAD] PID=${pid} ${preload} cmdline=${cmdline}${Z}"
+                found=$(( found + 1 ))
+            fi
+        fi
+    done
+
+    # --- 2. /proc vs ps cross-check ---
+    # A classic sign of a userspace rootkit hiding a process: it still has
+    # a live /proc/PID entry (the kernel itself isn't lying, only ps/ls
+    # are being fooled — e.g. via a hooked readdir()), but doesn't show up
+    # in `ps`. Re-verified against a SECOND /proc sample before reporting
+    # — a discrepancy from ordinary process churn (something exiting
+    # between the two enumeration passes) is expected noise, not a
+    # finding, and would NOT survive a re-check moments later.
+    if command -v ps &>/dev/null; then
+        local proc_pids ps_pids missing p still_there
+        proc_pids=$(ls -d /proc/[0-9]* 2>/dev/null | sed 's|/proc/||' | sort -n)
+        ps_pids=$(ps -eo pid --no-headers 2>/dev/null | tr -d ' ' | sort -n)
+        missing=$(comm -23 <(echo "$proc_pids") <(echo "$ps_pids") 2>/dev/null)
+        if [ -n "$missing" ]; then
+            sleep 0.3
+            still_there=$(ps -eo pid --no-headers 2>/dev/null | tr -d ' ' | sort -n)
+            for p in $missing; do
+                [ -d "/proc/$p" ] || continue   # already exited -> just churn
+                if ! echo "$still_there" | grep -qx "$p"; then
+                    local pcmd; pcmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | head -c 150)
+                    echo -e "${R}[!] [PROCESS_HIDDEN_FROM_PS] PID=${p} visible in /proc but not ps, twice -- cmdline=${pcmd}${Z}"
+                    found=$(( found + 1 ))
+                fi
+            done
+        fi
+    fi
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "${G}[OK] No process anomalies detected${Z} (deleted binaries, known-malware hashes, LD_PRELOAD, ps/proc mismatch)"
+    else
+        echo -e "${Y}[*] ${found} process anomaly(ies) flagged above${Z} — investigate manually; this module cannot auto-quarantine a running process."
+    fi
+    echo -e "${C}[*] Note: catches simple/userspace rootkit techniques only — cannot see through a genuine kernel-level (LKM) rootkit, which can lie to /proc itself.${Z}"
+}
+
+# ============================================================================
+# MODULE: kernel/boot integrity check (-K/--check-kernel, --offline-root)
+#
+# THE POINT OF THIS MODULE ONLY HOLDS IF RUN FROM A TRUSTED KERNEL. Run
+# against the LIVE system, this is no better than scan_processes() above —
+# still going through whatever kernel is currently running, which a real
+# LKM rootkit fully controls and can lie to just like anything else. Its
+# real value is when paired with --offline-root: boot your host's rescue
+# system (every major provider — Hetzner, DigitalOcean, Vultr, OVH,
+# etc. — offers one; it's the practical cloud-VPS equivalent of a LiveCD,
+# just triggered manually through their control panel, not something this
+# script can do FROM WITHIN a system you don't trust the kernel of), mount
+# the suspect disk read-only somewhere (e.g. /mnt/suspect-root), then run:
+#   ./av.sh --offline-root /mnt/suspect-root -K -d /mnt/suspect-root
+# Now every check here reads through the RESCUE kernel, not the
+# potentially-compromised one — which is the entire reason this is
+# meaningfully different from running it live.
+#
+# Checks: kernel image + initramfs + loaded-module files against the
+# package manager's OWN recorded checksums (dpkg -V) — a tampered boot
+# image or an unowned .ko file are strong persistence indicators. This
+# reuses the exact same "package should own this system file" logic
+# already built for SUID/SGID verification, just aimed at /boot and
+# /lib/modules instead.
+#
+# ON REMEDIATION: this deliberately only ever REPORTS. A confirmed kernel/
+# boot-level compromise is not something to try to surgically fix in
+# place — standard incident response is full reinstall from a known-clean
+# image, not disinfection, precisely because nothing on a kernel-level-
+# compromised system can be trusted to judge its own cleanliness anymore.
+# This module's job is to hand you the evidence to make that call, not to
+# pretend it can quarantine a kernel the way it quarantines a PHP file.
+# ============================================================================
+CHECK_KERNEL=false     # -K/--check-kernel
+OFFLINE_ROOT=""         # --offline-root PATH — see module comment above
+
+scan_kernel_integrity() {
+    local root="${OFFLINE_ROOT:-}"
+    echo -e "${B}[*] Checking kernel/boot file integrity...${Z}"
+    if [ -z "$root" ]; then
+        echo -e "${Y}[WARN] Running against the LIVE kernel — if that kernel is what's"
+        echo -e "       compromised, this check can be lied to same as anything else."
+        echo -e "       For a check that actually means something against an LKM"
+        echo -e "       rootkit: boot your host's rescue/recovery system, mount the"
+        echo -e "       disk read-only, and re-run with --offline-root.${Z}"
+    fi
+
+    if ! command -v dpkg &>/dev/null; then
+        echo -e "${Y}[WARN] dpkg not found -> can't cross-check against package records, skipping${Z}"
+        return
+    fi
+
+    local dpkg_root_arg=()
+    [ -n "$root" ] && dpkg_root_arg=(--root="$root")
+
+    local found=0 pkg md5file relpath expected actual f
+    # Every /boot and /lib/modules file that dpkg -S can attribute to a
+    # package gets its checksum cross-checked against that package's own
+    # record. Files it can't attribute at all (not owned by any package —
+    # a hand-dropped .ko, a DKMS-built module, or a genuinely planted
+    # rootkit module) are reported separately as lower-confidence
+    # "unowned" findings, since legitimate reasons for that exist too
+    # (custom-compiled drivers) — worth a look, not proof by itself.
+    for f in "${root}/boot"/vmlinuz* "${root}/boot"/initrd* "${root}/boot"/initramfs* \
+             $(find "${root}/lib/modules" -name "*.ko" -o -name "*.ko.xz" -o -name "*.ko.zst" 2>/dev/null); do
+        [ -f "$f" ] || continue
+        relpath="${f#$root/}"
+        pkg=$(dpkg "${dpkg_root_arg[@]}" -S "/$relpath" 2>/dev/null | head -1 | cut -d: -f1)
+        if [ -z "$pkg" ]; then
+            echo -e "${Y}[!] [KERNEL_FILE_UNOWNED] ${f} — not tracked by any installed package${Z}"
+            found=$(( found + 1 ))
+            continue
+        fi
+        md5file="${root}/var/lib/dpkg/info/${pkg}.md5sums"
+        [ -f "$md5file" ] || md5file="${root}/var/lib/dpkg/info/${pkg%:*}.md5sums"
+        [ -f "$md5file" ] || continue
+        expected=$(grep -F "  ${relpath}" "$md5file" 2>/dev/null | awk '{print $1}' | head -1)
+        [ -z "$expected" ] && continue
+        actual=$(md5sum "$f" 2>/dev/null | cut -d' ' -f1)
+        if [ "$expected" != "$actual" ]; then
+            echo -e "${R}[!] [KERNEL_FILE_TAMPERED] ${f} (package: ${pkg}) — checksum does NOT match package record${Z}"
+            found=$(( found + 1 ))
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "${G}[OK] No kernel/boot integrity issues found${Z} against package records"
+    else
+        echo -e "${R}[*] ${found} kernel/boot finding(s) above.${Z} If this was run with --offline-root"
+        echo -e "    (trusted rescue kernel), treat a TAMPERED result as strong evidence for a full"
+        echo -e "    rebuild — do not attempt to patch a compromised kernel/module in place."
+    fi
 }
 
 # ============================================================================
@@ -2145,6 +2954,39 @@ check_deps() {
 # ============================================================================
 # 12. MODULE: file collection & worker orchestration
 # ============================================================================
+# Purely informational — looks (shallow, few levels deep, fast) for
+# well-known marker files of common CMS platforms in the scan target, to
+# label the report with what it's likely looking at. Deliberately does
+# NOT exclude or deprioritize anything based on this: a CMS's own
+# cache/tmp/upload directories are exactly where a webshell is most
+# likely to land (writable, less scrutinized) — auto-excluding them for
+# "performance" would create a false sense of thoroughness while
+# silently skipping the places that matter most. This is identification
+# only, nothing more.
+detect_cms() {
+    local root="$1" found=()
+    [ -d "$root" ] || return
+    local f
+    for f in "$root"/wp-config.php "$root"/*/wp-config.php; do
+        [ -f "$f" ] && { found+=("WordPress"); break; }
+    done
+    for f in "$root"/configuration.php "$root"/*/configuration.php; do
+        [ -f "$f" ] && bb grep -ql "JConfig" "$f" 2>/dev/null && { found+=("Joomla"); break; }
+    done
+    [ -d "$root/bitrix" ] && found+=("Bitrix")
+    for f in "$root"/sites/default/settings.php "$root"/*/sites/default/settings.php; do
+        [ -f "$f" ] && { found+=("Drupal"); break; }
+    done
+    for f in "$root"/engine/data/dbconfig.php "$root"/*/engine/data/dbconfig.php; do
+        [ -f "$f" ] && { found+=("DataLife Engine"); break; }
+    done
+    [ -d "$root/wp-content" ] && [ ${#found[@]} -eq 0 ] && found+=("WordPress")
+    for f in "$root"/config.inc.php "$root"/*/config.inc.php; do
+        [ -f "$f" ] && bb grep -ql "PrestaShop\|OpenCart" "$f" 2>/dev/null && { found+=("PrestaShop/OpenCart-family"); break; }
+    done
+    ((${#found[@]})) && { printf '%s' "${found[0]}"; return; }
+}
+
 print_banner() {
     echo -e "${B}=================================================${Z}"
     echo -e "${B} Oprhus AV Scanner Unified v${VERSION}${Z}  [OS: $OS | ARCH: $ARCH]"
@@ -2153,6 +2995,8 @@ print_banner() {
     echo -e " Target       : ${C}${ROOT_DIR}${Z}"
     echo -e " Signatures   : ${C}${SIGNATURES}${Z}"
     echo -e " Max size     : ${C}${MAX_SCAN_MB} MB${Z}"
+    local cms_detected; cms_detected=$(detect_cms "$ROOT_DIR")
+    [ -n "$cms_detected" ] && echo -e " Detected CMS : ${C}${cms_detected}${Z} (informational only — nothing is excluded based on this)"
     echo -e " SHA256 / MD5 : ${C}${SHA256_CMD} / ${MD5_CMD}${Z}"
     echo -e " YARA         : ${C}${YARA_CMD}${Z}"
     echo -e " strings/file : ${C}${STRINGS_CMD} / built-in magic-bytes${Z}"
@@ -2172,6 +3016,98 @@ print_banner() {
         echo -e " Real-time    : ${C}ON${Z} (starts after the base scan)"
     fi
     echo -e "${B}=================================================${Z}"
+}
+
+# ============================================================================
+# MODULE: incremental scan cache (-I/--incremental, auto-on for -w)
+#
+# Persists a "path -> (mtime, size)" record for every file found CLEAN on
+# the last run. On a later run, any file whose mtime+size still matches is
+# skipped ENTIRELY — never queued to a worker, so it costs zero disk I/O,
+# not just a cheap in-worker check. This is the biggest lever on an
+# IOPS-capped host for anything that gets rescanned repeatedly (real-time
+# mode's base scan being the main case, but works for any repeat scan of
+# the same tree via -I).
+#
+# Cache location defaults under the signature dir (persists like the
+# compiled-signature cache) unless overridden with --incremental-cache.
+# A file that comes back with a THREAT is never written to the cache, so
+# it's always re-verified on the next run rather than silently trusted.
+# ============================================================================
+init_incremental_cache() {
+    [ -n "$INCREMENTAL_CACHE_FILE" ] || INCREMENTAL_CACHE_FILE="${SIGNATURES}/.incremental_cache.tsv"
+    mkdir -p "$(dirname "$INCREMENTAL_CACHE_FILE")" 2>/dev/null
+    [ -f "$INCREMENTAL_CACHE_FILE" ] || : > "$INCREMENTAL_CACHE_FILE"
+}
+
+# Filters $WORK_DIR/all_files_raw.tsv (size\tmode\tmtime\tpath, 4 fields)
+# down into $WORK_DIR/all_files.tsv (size\tmode\tpath, the worker's normal
+# 3-field format) — dropping any line whose (path, mtime, size) exactly
+# matches a cache entry. Sets SKIPPED_UNCHANGED for the final report.
+apply_incremental_filter() {
+    local raw="$WORK_DIR/all_files_raw.tsv"
+    local out="$WORK_DIR/all_files.tsv"
+
+    if [ "$INCREMENTAL_MODE" != true ] || [ ! -s "$INCREMENTAL_CACHE_FILE" ]; then
+        bb awk -F'\t' '{print $1"\t"$2"\t"$4}' "$raw" > "$out" 2>/dev/null
+        SKIPPED_UNCHANGED=0
+        return
+    fi
+
+    local skipcount_file="$WORK_DIR/.skipped_count"
+    bb awk -F'\t' -v cachefile="$INCREMENTAL_CACHE_FILE" -v skipfile="$skipcount_file" '
+        BEGIN {
+            while ((getline line < cachefile) > 0) {
+                split(line, c, "\t")
+                known[c[1] "\x1f" c[2] "\x1f" c[3]] = 1   # path\x1fmtime\x1fsize
+            }
+            close(cachefile)
+        }
+        {
+            size=$1; mode=$2; mtime=$3; path=$4
+            if ((path "\x1f" mtime "\x1f" size) in known) { skipped++; next }
+            print size "\t" mode "\t" path
+        }
+        END { print skipped+0 > skipfile }
+    ' "$raw" > "$out" 2>/dev/null
+    SKIPPED_UNCHANGED=$(cat "$skipcount_file" 2>/dev/null || echo 0)
+}
+
+# Post-scan: merges this run's results back into the cache. Files that
+# were scanned (not skipped) and came back clean get added/refreshed;
+# files that came back as a THREAT are explicitly dropped from the cache
+# (always re-verified next time); files outside this run's scope entirely
+# keep whatever cache entry they already had.
+update_incremental_cache() {
+    [ "$INCREMENTAL_MODE" = true ] || return 0
+    local raw="$WORK_DIR/all_files_raw.tsv"
+    [ -s "$raw" ] || return 0
+
+    local threat_paths="$WORK_DIR/.threat_paths"
+    bb grep -h "^THREAT:" "$WORK_DIR/reports"/pool_*.txt 2>/dev/null | cut -d'|' -f2 | bb sort -u > "$threat_paths" 2>/dev/null
+    [ -f "$threat_paths" ] || : > "$threat_paths"
+
+    local new_cache="${INCREMENTAL_CACHE_FILE}.new"
+    bb awk -F'\t' -v threatfile="$threat_paths" -v oldcache="$INCREMENTAL_CACHE_FILE" '
+        BEGIN {
+            while ((getline line < threatfile) > 0) { threat[line] = 1 }
+            close(threatfile)
+            while ((getline line < oldcache) > 0) {
+                split(line, c, "\t")
+                oldval[c[1]] = line
+            }
+            close(oldcache)
+        }
+        {
+            size=$1; mtime=$3; path=$4
+            seen[path] = 1
+            if (!(path in threat)) print path "\t" mtime "\t" size
+        }
+        END {
+            for (p in oldval) if (!(p in seen)) print oldval[p]
+        }
+    ' "$raw" > "$new_cache" 2>/dev/null
+    mv -f "$new_cache" "$INCREMENTAL_CACHE_FILE" 2>/dev/null
 }
 
 collect_files() {
@@ -2199,33 +3135,79 @@ collect_files() {
         [ -n "$p" ] && excl+=(-not -path "$p" -not -path "${p}/*")
     done
 
-    if [ "$OS" = "linux" ] && bb find "$SCRIPT_DIR" -maxdepth 0 -printf "" 2>/dev/null; then
-        bb find "$ROOT_DIR" -type f "${excl[@]}" -printf "%s\t%m\t%p\n" 2>/dev/null > "$WORK_DIR/all_files.tsv"
+    # FIX (real bug found, pre-existing — not introduced by incremental
+    # mode): this printf-capability check used to go through bb() (which
+    # routes to busybox's find when busybox is bundled/preferred) — but
+    # busybox's find does NOT support -printf AT ALL ("unrecognized:
+    # -printf"). Since busybox is the preferred path throughout this
+    # script, that meant the size/mode-via-printf optimization here had
+    # essentially never actually been active in practice: every file fell
+    # back to the worker doing individual stat() calls per file instead of
+    # getting size+mode for free from the one `find` pass. GNU find (the
+    # system one, NOT busybox's) supports -printf properly, so this now
+    # explicitly uses `command find` for this specific call, bypassing
+    # bb() on purpose — busybox find is still used everywhere else it's
+    # actually correct (the plain -print fallback below, and every other
+    # find call in the script).
+    local sys_find_printf_ok=false
+    if [ "$OS" = "linux" ] && command -v find &>/dev/null && command find "$SCRIPT_DIR" -maxdepth 0 -printf "" 2>/dev/null; then
+        sys_find_printf_ok=true
+    fi
+
+    if [ "$sys_find_printf_ok" = true ]; then
+        command find "$ROOT_DIR" -type f "${excl[@]}" -printf "%s\t%m\t%T@\t%p\n" 2>/dev/null > "$WORK_DIR/all_files_raw.tsv"
+        apply_incremental_filter
     else
+        # No printf-capable find available (BSD find on macOS, or no
+        # system find at all) — incremental mode has no effect on this
+        # path, every file is always scanned (correct, just not
+        # IOPS-optimized here).
         bb find "$ROOT_DIR" -type f "${excl[@]}" -print 2>/dev/null > "$WORK_DIR/all_files.tsv"
+        SKIPPED_UNCHANGED=0
     fi
     TOTAL_FILES=$(bb wc -l < "$WORK_DIR/all_files.tsv" | tr -d ' ')
-    echo -e "[*] Files queued: ${C}${TOTAL_FILES}${Z}\n"
+    if [ "${SKIPPED_UNCHANGED:-0}" -gt 0 ] 2>/dev/null; then
+        echo -e "[*] Files queued: ${C}${TOTAL_FILES}${Z} (skipped ${C}${SKIPPED_UNCHANGED}${Z} unchanged since last clean scan)\n"
+    else
+        echo -e "[*] Files queued: ${C}${TOTAL_FILES}${Z}\n"
+    fi
 }
 
 split_pools() {
     bb awk -v w="$WORKERS" -v d="$WORK_DIR/reports" '{ print > (d "/pool_" (NR % w) ".txt") }' "$WORK_DIR/all_files.tsv"
 }
 
+# Launches CMD... as its own SESSION/PROCESS GROUP LEADER when setsid is
+# available (checked once, cached in HAS_SETSID) — this is what lets
+# cleanup() below kill a worker's ENTIRE process tree (including whatever
+# yara/grep/etc subprocess it currently has running) with one signal,
+# instead of only the worker's own PID while any in-flight child gets
+# orphaned and keeps running. Falls back to a plain background launch if
+# setsid isn't available (non-Linux, minimal container) — cleanup() then
+# falls back too, matching the previous (imperfect but not worse) behavior.
+_launch_grouped() {
+    if [ "$HAS_SETSID" = true ]; then
+        setsid "$@" &
+    else
+        "$@" &
+    fi
+}
+
 launch_workers() {
     echo -e "[*] Launching ${WORKERS} workers (batch hash + YARA)...\n"
     WORKER_PIDS=()
+    command -v setsid &>/dev/null && HAS_SETSID=true
     local pool wid qdir=""
     [ "$QUARANTINE_ENABLED" = true ] && qdir="$QUARANTINE_DIR"
     for pool in "$WORK_DIR/reports"/pool_*.txt; do
         [ -f "$pool" ] || continue
         wid=$(basename "$pool" .txt)
-        bash "$WORKER_FILE" \
+        _launch_grouped "$WORKER_BASH" "$WORKER_FILE" \
             "$pool" "$wid" "$WORK_DIR/reports" \
             "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
             "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
             "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" &
+            "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD"
         WORKER_PIDS+=($!)
     done
 }
@@ -2292,6 +3274,30 @@ show_progress() {
             all_pids="${active_pids[*]} $child_pids"
             mem_mb=$(ps -o rss= -p $all_pids 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}')
         fi
+        # FIX (real bug reported): process RSS is BLIND to /dev/shm
+        # (tmpfs) usage — reading a file from tmpfs doesn't inflate the
+        # READING process's own RSS the way heap/stack allocations do,
+        # even though tmpfs content is unambiguously real system RAM
+        # (confirmed directly: a 50MB file in /dev/shm showed 0 in the
+        # reading process's RSS). This under-reported real usage
+        # specifically whenever WORK_DIR or --sig-in-ram's SIG_DIR live in
+        # /dev/shm (~300MB actual vs ~12MB shown, per the report) — add
+        # actual tmpfs usage for both paths on top of process RSS.
+        local shm_mb=0 _du
+        case "$WORK_DIR" in
+            /dev/shm/*)
+                _du=$(du -sm "$WORK_DIR" 2>/dev/null | cut -f1)
+                shm_mb=$(( shm_mb + ${_du:-0} ))
+                ;;
+        esac
+        case "$SIG_DIR" in
+            "$WORK_DIR"/*) : ;;  # already counted above, part of WORK_DIR
+            /dev/shm/*)
+                _du=$(du -sm "$SIG_DIR" 2>/dev/null | cut -f1)
+                shm_mb=$(( shm_mb + ${_du:-0} ))
+                ;;
+        esac
+        mem_mb=$(( mem_mb + shm_mb ))
         local ram_pct=0
         [ "$MAX_RAM_MB" -gt 0 ] && ram_pct=$(( mem_mb * 100 / MAX_RAM_MB ))
 
@@ -2323,7 +3329,24 @@ start_monitor() {
 cleanup() {
     kill "$MONITOR_PID" 2>/dev/null || true
     local p
-    for p in "${WORKER_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    for p in "${WORKER_PIDS[@]}"; do
+        # FIX (real bug reported): a worker currently blocked inside a
+        # foreground child call (yara/grep/etc via command substitution)
+        # does NOT pass a signal on to that child when the worker itself
+        # is killed — the child gets orphaned (re-parented to init) and
+        # keeps running/using CPU indefinitely, exactly what was observed:
+        # stopping the script left yara processes still loading the CPU.
+        # -TERM to the NEGATIVE pid signals the whole PROCESS GROUP at
+        # once (worker + whatever it currently has running), but that's
+        # only safe/correct when the worker was launched with setsid
+        # (guarantees its own PID == its own PGID — otherwise a negative
+        # PID could coincidentally target an unrelated process group).
+        if [ "$HAS_SETSID" = true ]; then
+            kill -TERM -"$p" 2>/dev/null || kill "$p" 2>/dev/null || true
+        else
+            kill "$p" 2>/dev/null || true
+        fi
+    done
     cleanup_realtime
     tput cnorm 2>/dev/null || true
 
@@ -2337,6 +3360,13 @@ cleanup() {
     fi
 
     rm -rf "$WORK_DIR"
+    # SIG_DIR lives OUTSIDE WORK_DIR when --sig-in-ram placed it directly
+    # under /dev/shm (see init_workdir) — the rm -rf above wouldn't touch
+    # a sibling path, so clean it up explicitly too.
+    case "$SIG_DIR" in
+        "$WORK_DIR"/*) : ;;  # already covered by the rm -rf above
+        /dev/shm/av_sigs_*) rm -rf "$SIG_DIR" 2>/dev/null ;;
+    esac
     echo -e "\n${Y}[WARN] Scan aborted${Z}"
     if [ -n "$LIVE_REPORT_FILE" ]; then
         echo -e "${C}[*] ${found} threat(s) found before interruption -> saved to: ${LIVE_REPORT_FILE}${Z}"
@@ -2372,7 +3402,10 @@ build_report() {
  Quarantined        : $QC ($QUARANTINE_DIR)"
     local suppressed_line=""
     [ "${SC:-0}" -gt 0 ] 2>/dev/null && suppressed_line="
- Suppressed (ignore_sigs): $SC ($IGNORE_SIGS_FILE)"
+ Suppressed (ignore_sigs / known vendor obfuscation): $SC"
+    local skipped_line=""
+    [ "$INCREMENTAL_MODE" = true ] && skipped_line="
+ Skipped (unchanged): $SKIPPED_UNCHANGED (incremental cache: $INCREMENTAL_CACHE_FILE)"
 
     # Diagnostic time breakdown: these 4 numbers are SUMMED ACROSS ALL
     # WORKERS (so they can individually exceed wall-clock elapsed time when
@@ -2399,7 +3432,7 @@ build_report() {
  OS / Arch          : $OS / $ARCH
  Target             : $ROOT_DIR
  Files Scanned      : $TF
- Threats Found      : $TT${quarantine_line}${suppressed_line}
+ Threats Found      : $TT${quarantine_line}${suppressed_line}${skipped_line}
  Time Elapsed       : $(printf '%02d:%02d' $(( ELAPSED_S/60 )) $(( ELAPSED_S%60 )))
  Avg Speed          : ${SPEED} files/s
  Workers            : $WORKERS${timing_line}
@@ -2463,12 +3496,13 @@ start_realtime_worker() {
 
     # The worker opens the FIFO for reading and blocks inside its usual
     # run_scan_loop(), waiting for new path lines.
-    bash "$WORKER_FILE" \
+    command -v setsid &>/dev/null && HAS_SETSID=true
+    _launch_grouped "$WORKER_BASH" "$WORKER_FILE" \
         "$REALTIME_FIFO" "rt" "$WORK_DIR/reports" \
         "$SIG_DIR" "$MAX_SCAN_MB" "$OS" \
         "$SHA256_CMD" "$MD5_CMD" "$STRINGS_CMD" "$FILE_CMD" "$YARA_CMD" \
         "$qdir" "$QUARANTINE_PERM" "$BUSYBOX_BIN" \
-        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" &
+        "$BATCH_SIZE" "$HEUR_BATCH_SIZE" "$PE_BATCH_SIZE" "$LIVE_REPORT_FILE" "$IGNORE_SIGS_FILE" "$SCAN_ARCHIVES" "$ARCHIVE_MAX_MB" "$ARCHIVE_MAX_EXTRACT_MB" "$ARCHIVE_MAX_DEPTH" "$ARCHIVE_MAX_FILES" "$USE_RAM" "$GREP_BIN" "$SUID_VERIFY_MODE" "$YARA_TIMEOUT_SEC" "$LONG_TIME_MODE" "$LONG_TIME_THRESHOLD_SEC" "$ARCHIVE_RAM_MAX_MB" "$ARCHIVE_USE_RAM" "$GENERIC_OBFUSCATION_RULES_FILE" "$KNOWN_VENDOR_OBFUSCATION_FILE" "$SANDBOX_MODE" "$SANDBOX_USER" "$SANDBOX_MEM_KB" "$SANDBOX_CPU_SEC" "$DEEP_MODE" "$SHA1_CMD"
     REALTIME_WORKER_PID=$!
 
     # Keep the write fd (3) open permanently — opening/closing per event
@@ -2520,7 +3554,13 @@ watch_poll() {
 
 cleanup_realtime() {
     exec 3>&- 2>/dev/null || true
-    [ -n "$REALTIME_WORKER_PID" ] && kill "$REALTIME_WORKER_PID" 2>/dev/null || true
+    if [ -n "$REALTIME_WORKER_PID" ]; then
+        if [ "$HAS_SETSID" = true ]; then
+            kill -TERM -"$REALTIME_WORKER_PID" 2>/dev/null || kill "$REALTIME_WORKER_PID" 2>/dev/null || true
+        else
+            kill "$REALTIME_WORKER_PID" 2>/dev/null || true
+        fi
+    fi
     [ -n "$REALTIME_TAIL_PID" ] && kill "$REALTIME_TAIL_PID" 2>/dev/null || true
     [ -n "$REALTIME_FIFO" ] && rm -f "$REALTIME_FIFO" 2>/dev/null || true
 }
@@ -2549,9 +3589,44 @@ main() {
     detect_platform
     parse_args "$@"
     setup_colors
+    apply_low_priority
+
+    # -I is implied by -w unless the person explicitly said --no-incremental
+    # — real-time mode's whole point is running the base scan repeatedly
+    # (service restarts, periodic re-supervision), and that's exactly the
+    # case where NOT re-reading every unchanged file every time matters
+    # most on an IOPS-capped host.
+    if [ "$REALTIME_MODE" = true ] && [ -z "$INCREMENTAL_EXPLICIT_OFF" ]; then
+        INCREMENTAL_MODE=true
+    fi
+
+    # --deep/--paranoid overrides incremental caching off regardless of
+    # how it got turned on — deep mode means every file gets a full,
+    # fresh check, never trusting a cached "was clean before" verdict.
+    if [ "$DEEP_MODE" = true ]; then
+        INCREMENTAL_MODE=false
+    fi
+
+    # Same reasoning for SUID/SGID package-checksum verification: a
+    # one-off audit scan (no cache, run once, the common case) shouldn't
+    # pay dpkg lookups it'll never benefit from again — but -w keeps the
+    # worker alive watching the SAME tree, where catching a system binary
+    # getting swapped mid-monitoring is exactly the point.
+    if [ "$REALTIME_MODE" = true ] && [ -z "$SUID_VERIFY_EXPLICIT_OFF" ]; then
+        SUID_VERIFY_MODE=true
+    fi
 
     if [ "$DO_SETUP" = true ]; then
-        run_self_setup
+        # Runs through the extracted standalone module (not the inline
+        # function directly) — this is the actual, meaningful benefit of
+        # having it as a separate file: it's not just "the same code
+        # somewhere else", every real --setup run exercises the EXACT
+        # file a person would use to debug it standalone, so the two
+        # never drift apart.
+        extract_setup_module
+        local setup_args=()
+        [ "${SETUP_FORCE:-false}" = true ] && setup_args+=(--force)
+        "$WORKER_BASH" "$SCRIPT_DIR/setup_module.sh" "${setup_args[@]}"
         exit $?
     fi
 
@@ -2591,10 +3666,53 @@ main() {
     init_workdir
     check_deps
     init_quarantine
-    init_ignore_sigs
 
     extract_worker
     compile_signatures "$SIGNATURES" "$SIG_DIR"
+
+    if [ "$SCAN_PROCESSES" = true ]; then
+        if [ -n "$OFFLINE_ROOT" ]; then
+            echo -e "${Y}[WARN] -P/--scan-processes doesn't make sense with --offline-root${Z}"
+            echo -e "${Y}       (there are no running processes to inspect on a mounted, not-booted disk) — skipping.${Z}"
+        else
+            scan_processes
+            # -P without an explicit -d means "just check processes" —
+            # skip the whole file-tree scan entirely rather than
+            # defaulting to scanning /mnt, which the person never asked for.
+            if [ -z "$ROOT_DIR_EXPLICIT" ] && [ "$CHECK_KERNEL" != true ]; then
+                exit 0
+            fi
+            echo ""
+        fi
+    fi
+
+    if [ "$CHECK_KERNEL" = true ]; then
+        scan_kernel_integrity
+        if [ -z "$ROOT_DIR_EXPLICIT" ]; then
+            exit 0
+        fi
+        echo ""
+    fi
+
+    # FIX (real bug reported): these two used to run BEFORE
+    # compile_signatures. Both auto-create a file DIRECTLY inside
+    # $SIGNATURES the first time they're used (ignore_sigs,
+    # .incremental_cache.tsv) — creating a new direct child bumps the
+    # PARENT directory's own mtime. compile_signatures' cache-freshness
+    # check compares its compiled flag against exactly that parent mtime,
+    # so on the very first run after either feature's file didn't exist
+    # yet, the freshly-written cache would look "stale" on the VERY NEXT
+    # invocation even though nothing about the actual signature data had
+    # changed — forcing a full, unnecessary recompile every time (this is
+    # what caused "-u finishes, cache is fresh, but the next plain scan
+    # recompiles everything anyway"). Running them after compile_signatures
+    # sidesteps this entirely — neither has any dependency on running
+    # earlier (ignore_sigs is only consulted per-threat during scanning;
+    # the incremental cache is only consulted in collect_files(), which
+    # itself runs after this point).
+    init_ignore_sigs
+    init_incremental_cache
+    init_vendor_obfuscation_allowlist
 
     init_live_report
 
@@ -2606,11 +3724,17 @@ main() {
     launch_workers
 
     start_monitor
-    trap cleanup INT TERM
+    # HUP added alongside INT/TERM: closing the terminal/session (not just
+    # Ctrl+C) sends SIGHUP to the foreground process group — without
+    # trapping it too, the script (and its workers) would die without
+    # cleanup running at all, leaving the same kind of orphaned processes
+    # this whole fix is about.
+    trap cleanup INT TERM HUP
 
     wait_for_workers
 
     END_MS=$(now_ms)
+    update_incremental_cache
     build_report
     print_report
     save_report
@@ -2623,6 +3747,10 @@ main() {
     fi
 
     rm -rf "$WORK_DIR"
+    case "$SIG_DIR" in
+        "$WORK_DIR"/*) : ;;
+        /dev/shm/av_sigs_*) rm -rf "$SIG_DIR" 2>/dev/null ;;
+    esac
     exit 0
 }
 
@@ -2671,6 +3799,32 @@ ARCHIVE_MAX_FILES="${24:-2000}"
 ARCHIVE_DEPTH_CUR=0            # current recursion depth, tracked at runtime
 USE_RAM="${25:-true}"          # prefer /dev/shm for archive extraction too
 GREP_BIN="${26:-}"             # bundled static grep — see MODULE below
+SUID_VERIFY_MODE="${27:-false}" # dpkg/rpm checksum verify for SUID/SGID —
+                                 # off by default, on for -w (real-time)
+YARA_TIMEOUT_SEC="${28:-30}"    # abort a single yara call after this long
+                                 # (yara's own -a flag) — see global comment
+LONG_TIME_MODE="${29:-false}"   # -L/--long-time: log slow batches
+LONG_TIME_THRESHOLD_SEC="${30:-20}"
+ARCHIVE_RAM_MAX_MB="${31:-50}"  # extract archives up to this compressed
+                                 # size straight into RAM — see global note
+ARCHIVE_USE_RAM="${32:-true}"   # explicit --no-ram choice, NOT auto-tuned
+                                 # by the low-RAM-profile logic — see main
+                                 # script comment where it's captured
+GENERIC_OBFUSCATION_RULES_FILE="${33:-}"
+KNOWN_VENDOR_OBFUSCATION_FILE="${34:-}"
+SANDBOX_MODE="${35:-none}"
+SANDBOX_USER="${36:-nobody}"
+SANDBOX_MEM_KB="${37:-1048576}"
+SANDBOX_CPU_SEC="${38:-60}"
+DEEP_MODE="${39:-false}"       # --deep/--paranoid: bypass ALL automatic
+                                 # suppression (ignore_sigs, vendor
+                                 # obfuscation allowlist) — the whole
+                                 # point of deep mode is showing
+                                 # everything and letting the person
+                                 # decide, not trusting our own filters.
+SHA1_CMD="${40:-none}"          # recovers ClamAV .hsb SHA1 entries that
+                                 # used to be silently dropped — see
+                                 # detect_sha1() in the main script.
 
 REPORT="$REPORT_DIR/${WORKER_ID}.txt"
 PROGRESS="$REPORT_DIR/${WORKER_ID}.progress"
@@ -2688,6 +3842,32 @@ T_CHECK_MS=0
 _now_ms() {
     date +%s%3N 2>/dev/null || echo $(( $(date +%s) * 1000 ))
 }
+
+# FIX (real bug found — not just in the new vendor-obfuscation feature,
+# but a LATENT bug in the pre-existing ignore_sigs mechanism too): grep -f
+# treats EVERY line of a pattern file as a literal pattern, including
+# comment lines starting with "#" — and this script's own auto-generated
+# template comments contain unbalanced parentheses (e.g. explaining
+# "eval(base64_decode" as prose), which makes grep -f error out entirely
+# ("Unmatched ( or \(") on the untouched default template. Strips
+# comment/blank lines ONCE per file at worker startup (not on every
+# check) into a filtered copy, used for all pattern-file grep -f lookups
+# from here on.
+_filter_patterns_file() {
+    local src="$1" dst="$2"
+    [ -n "$src" ] && [ -s "$src" ] || { : > "$dst" 2>/dev/null; return; }
+    bb grep -v '^[[:space:]]*#' "$src" 2>/dev/null | bb grep -v '^[[:space:]]*$' > "$dst" 2>/dev/null
+}
+_IGNORE_SIGS_FILTERED="$(mktemp 2>/dev/null || echo /tmp/av_ignore_sigs_filtered.$$)"
+_GENERIC_OBFUSCATION_FILTERED="$(mktemp 2>/dev/null || echo /tmp/av_generic_obf_filtered.$$)"
+_KNOWN_VENDOR_OBFUSCATION_FILTERED="$(mktemp 2>/dev/null || echo /tmp/av_vendor_obf_filtered.$$)"
+# NOTE: the actual _filter_patterns_file CALLS happen further down, after
+# this worker's own bb() is defined — bb() is a function, and top-level
+# code in a bash script runs sequentially as it's reached, so calling
+# anything that uses bb() from here (before its definition further below)
+# would silently fail (bb not yet a recognized command), leaving the
+# filtered files empty. Confirmed exactly this way via direct debug trace.
+
 # "Real" (non-busybox) grep, for the specific searches that need correct
 # binary-safe (-a) handling — busybox's grep confirmed to silently miss
 # matches in NUL-containing files even with -a. Prefers the bundled static
@@ -2707,6 +3887,7 @@ _has_real_grep() {
 MAX_SIZE=$(( MAX_SCAN_MB * 1024 * 1024 ))
 
 HAS_SHA256=false
+HAS_SHA1=false
 HAS_MD5=false
 HAS_B64=false
 HAS_STRINGS=false
@@ -2719,11 +3900,13 @@ YARA_TARGET=""
 BB_APPLETS=""
 
 declare -a BATCH_SHA=()
+declare -a BATCH_SHA1=()
 declare -a BATCH_MD5=()
 declare -a BATCH_YARA=()
 declare -a BATCH_HEUR=()
 declare -a BATCH_PE=()
 SHA_BATCH_CNT=0
+SHA1_BATCH_CNT=0
 MD5_BATCH_CNT=0
 YARA_BATCH_CNT=0
 HEUR_BATCH_CNT=0
@@ -2759,6 +3942,7 @@ bb() {
 # ----------------------------------------------------------------------------
 init_worker_state() {
     [ -s "$SIG_DIR/sha256.tsv" ] && HAS_SHA256=true
+    [ -s "$SIG_DIR/sha1.tsv" ] && HAS_SHA1=true
     [ -s "$SIG_DIR/md5.tsv" ] && HAS_MD5=true
     [ -s "$SIG_DIR/b64_payloads.tsv" ] && HAS_B64=true
     [ -s "$SIG_DIR/strings.txt" ] && HAS_STRINGS=true
@@ -2789,6 +3973,12 @@ init_worker_state() {
     if [ "$HAS_YARA" = true ] && [ "$HAS_STR_SIG_MAP" = true ]; then
         HAS_STRINGS=false
     fi
+
+    # Now safe to filter the pattern files (bb() is defined by this point
+    # in the worker — see the NOTE further up where these get declared).
+    _filter_patterns_file "$IGNORE_SIGS_FILE" "$_IGNORE_SIGS_FILTERED"
+    _filter_patterns_file "$GENERIC_OBFUSCATION_RULES_FILE" "$_GENERIC_OBFUSCATION_FILTERED"
+    _filter_patterns_file "$KNOWN_VENDOR_OBFUSCATION_FILE" "$_KNOWN_VENDOR_OBFUSCATION_FILTERED"
 }
 
 # ----------------------------------------------------------------------------
@@ -2811,6 +4001,32 @@ _resolve_str_sig() {
     [ -z "$pat" ] && return 1
     echo "$pat"
     return 0
+}
+
+# Returns success (0) if a YARA match should be auto-suppressed as known,
+# legitimate vendor code-obfuscation (e.g. a CMS encoding its own core
+# files for license protection) rather than reported — see
+# init_vendor_obfuscation_allowlist in the main script for the two files
+# this reads. BOTH conditions must hold, checked cheapest-first: the rule
+# that fired has to be in the "too broad to tell obfuscation apart from a
+# real backdoor" list, AND the file's own content has to match a known
+# vendor's specific fingerprint — a rule-name match alone never suppresses
+# anything by itself.
+_is_vendor_obfuscation() {
+    local rule="$1" file="$2"
+    # DEEP_MODE bypasses this too — same reasoning as threat()'s
+    # ignore_sigs bypass: --deep means show everything, don't trust any
+    # automatic filter, including our own vendor-obfuscation allowlist.
+    [ "$DEEP_MODE" = "true" ] && return 1
+    [ -s "$_GENERIC_OBFUSCATION_FILTERED" ] || return 1
+    [ -s "$_KNOWN_VENDOR_OBFUSCATION_FILTERED" ] || return 1
+    echo "$rule" | bb grep -qE -f "$_GENERIC_OBFUSCATION_FILTERED" 2>/dev/null || return 1
+    if _has_real_grep; then
+        _real_grep -qE -f "$_KNOWN_VENDOR_OBFUSCATION_FILTERED" "$file" 2>/dev/null && return 0
+    else
+        bb grep -qE -f "$_KNOWN_VENDOR_OBFUSCATION_FILTERED" "$file" 2>/dev/null && return 0
+    fi
+    return 1
 }
 
 _stat_size() {
@@ -2896,29 +4112,57 @@ _pe_section_table() {
 # Deliberately NOT applied to per-file calls (check_file_heuristics) — the
 # timing itself forks `date`, and doing that thousands of times would add
 # real overhead to exactly what we're trying to measure.
+#
+# -L/--long-time: when a SINGLE batch call takes longer than
+# LONG_TIME_THRESHOLD_SEC, log it immediately (batch type, elapsed time,
+# and the exact file list) — pure observability, no behavior change to
+# the scan itself. This is the direct "what got stuck" answer requested:
+# instead of inferring from a hung-looking process, the log shows exactly
+# which batch (and which files in it) was slow, the moment it happens,
+# while the scan keeps going.
+#
+# NOTE: written to a DEDICATED file (LIVE_REPORT_FILE + ".slow"), not
+# LIVE_REPORT_FILE itself — on a normal (non-interrupted) finish,
+# save_report() in the main script OVERWRITES LIVE_REPORT_FILE with the
+# clean final summary, which would silently wipe out every slow-batch
+# entry logged during a scan that ultimately completed successfully. A
+# separate file survives that regardless of how the scan ends.
+_log_if_long() {
+    local kind="$1" elapsed_ms="$2"; shift 2
+    [ "$LONG_TIME_MODE" = "true" ] || return
+    [ $(( elapsed_ms / 1000 )) -ge "$LONG_TIME_THRESHOLD_SEC" ] || return
+    [ -n "$LIVE_REPORT_FILE" ] || return
+    printf '[%s] [SLOW_BATCH] type=%s elapsed_ms=%d files=%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$kind" "$elapsed_ms" "$*" \
+        >> "${LIVE_REPORT_FILE}.slow" 2>/dev/null
+}
 _timed_hash_batch() {
     local _t0; _t0=$(_now_ms)
     process_hash_batch "$@"
     local _t1; _t1=$(_now_ms)
     T_HASH_MS=$(( T_HASH_MS + _t1 - _t0 ))
+    _log_if_long "hash" $(( _t1 - _t0 )) "$@"
 }
 _timed_yara_batch() {
     local _t0; _t0=$(_now_ms)
     process_yara_batch "$@"
     local _t1; _t1=$(_now_ms)
     T_YARA_MS=$(( T_YARA_MS + _t1 - _t0 ))
+    _log_if_long "yara" $(( _t1 - _t0 )) "$@"
 }
 _timed_heur_batch() {
     local _t0; _t0=$(_now_ms)
     process_heuristic_batch "$@"
     local _t1; _t1=$(_now_ms)
     T_HEUR_MS=$(( T_HEUR_MS + _t1 - _t0 ))
+    _log_if_long "heur" $(( _t1 - _t0 )) "$@"
 }
 _timed_pe_batch() {
     local _t0; _t0=$(_now_ms)
     process_pe_batch "$@"
     local _t1; _t1=$(_now_ms)
     T_PE_MS=$(( T_PE_MS + _t1 - _t0 ))
+    _log_if_long "pe" $(( _t1 - _t0 )) "$@"
 }
 
 # Batched (size, md5) lookup for a set of candidate PE files' sections
@@ -2996,10 +4240,36 @@ _verify_package_file() {
     local file="$1"
     [ -n "${_PKG_VERIFY_CACHE[$file]:-}" ] && { echo "${_PKG_VERIFY_CACHE[$file]}"; return; }
 
+    # FIX (real slowdown found and measured): `dpkg -S` on a file that's
+    # NOT package-owned takes over a SECOND (confirmed: 1.18s) — it has to
+    # linearly scan every installed package's file list before it can
+    # conclude there's no match. Package managers only ever install into a
+    # known, fixed set of system directories — a SUID/SGID file under a
+    # web root or home directory (exactly where this kept firing on a real
+    # scan) is essentially guaranteed not to be package-owned, so skip the
+    # lookup ENTIRELY for paths outside that set instead of paying ~1s+ to
+    # confirm the obvious on every such hit in a content tree. This is
+    # what was silently turning "average 8-9 files/s" into "3 files/s" —
+    # peak throughput (the batched hash/YARA path) was unaffected, but
+    # every SUID/SGID file outside /usr,/bin,/sbin,/lib,/opt added a
+    # second-plus synchronous stall outside any batching.
+    case "$file" in
+        /usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/opt/*) : ;;
+        *)
+            _PKG_VERIFY_CACHE[$file]="unowned"
+            echo "unowned"
+            return
+            ;;
+    esac
+
     local result="unowned"
     if command -v dpkg &>/dev/null; then
         local pkg
-        pkg=$(dpkg -S "$file" 2>/dev/null | head -1 | cut -d: -f1)
+        # timeout as defense in depth: even within a system dir, an
+        # unowned file (manually installed software, etc.) hits the same
+        # slow "confirm the negative" path — cap the worst case instead of
+        # letting a single lookup stall a whole batch.
+        pkg=$(timeout 2 dpkg -S "$file" 2>/dev/null | head -1 | cut -d: -f1)
         if [ -n "$pkg" ]; then
             local md5file="/var/lib/dpkg/info/${pkg}.md5sums"
             [ -f "$md5file" ] || md5file="/var/lib/dpkg/info/${pkg%:*}.md5sums"
@@ -3019,9 +4289,9 @@ _verify_package_file() {
             fi
         fi
     elif command -v rpm &>/dev/null; then
-        if rpm -qf "$file" &>/dev/null; then
+        if timeout 2 rpm -qf "$file" &>/dev/null; then
             local vout
-            vout=$(rpm -Vf "$file" 2>/dev/null)
+            vout=$(timeout 2 rpm -Vf "$file" 2>/dev/null)
             if [ -z "$vout" ]; then
                 result="verified"
             elif echo "$vout" | bb grep -q "^..5"; then
@@ -3108,6 +4378,245 @@ _archive_type() {
     esac
 }
 
+# ----------------------------------------------------------------------------
+# MODULE: sandboxed extraction (optional, --sandbox-mode)
+#
+# Archive extraction is the highest-risk operation in this whole script:
+# it parses an ATTACKER-CONTROLLED file format (zip/tar/7z/rar) with
+# external tools that have historically had real vulnerabilities (path
+# traversal / "zip slip", decompression bombs, parser buffer overflows).
+# This wraps that extraction in an isolation layer as defense-in-depth —
+# a bug in unzip/tar/7z exploited by a malicious archive is far less
+# dangerous running as an unprivileged, network-less, filesystem-isolated
+# process than running as whatever this scanner itself runs as (often
+# root, to reach protected files).
+#
+# Off by default (SANDBOX_MODE=none) — this changes nothing unless
+# explicitly requested via --sandbox-mode, and even then only wraps
+# archive extraction, not the rest of the scan.
+#
+# Rewritten from a person's own draft (credited to a suggestion from
+# another AI) after finding two real, serious bugs in it during review:
+#   1. bwrap mode had "2>/dev/null || true" INSIDE a backslash-continued
+#      argument list — that's not a per-argument fallback, it's a real
+#      shell "||", so bwrap's later arguments (--proc, --tmpfs, --uid,
+#      --gid, and the command to actually run) were silently NEVER
+#      passed at all. Confirmed by reproducing the exact pattern: only
+#      the arguments before the first "|| true" ever reached the command.
+#   2. chroot mode bind-mounted 5 directories but only ever `rm -rf`'d the
+#      chroot dir afterward — never unmounted them. Every archive
+#      processed would leak 5 more stale bind mounts, accumulating for
+#      the life of a long-running scan.
+# Both fixed below: conditional binds are built into an ARGS ARRAY with
+# separate statements before bwrap ever runs (no inline "|| true" inside
+# its argument list), and chroot mode unmounts everything (in reverse
+# order) in a trap before removing the directory.
+#
+# SANDBOX_MODE/SANDBOX_USER/SANDBOX_MEM_KB/SANDBOX_CPU_SEC are already set
+# from positional params above (33-38) — no re-declaration needed here.
+
+_sandbox_has() { command -v "$1" &>/dev/null; }
+
+_sandbox_run_bwrap() {
+    local target_dir="$1" archive_src="$2"; shift 2
+    local args=(
+        --unshare-all --new-session --die-with-parent
+        --ro-bind /usr /usr
+        --proc /proc --dev /dev
+        --tmpfs /home --tmpfs /root
+        --chdir /tmp
+        --setenv HOME /tmp --setenv USER nobody
+        --uid 65534 --gid 65534
+    )
+    # bind /bin, /lib, /lib64, /sbin only if they exist as real entries —
+    # checked as SEPARATE statements before the call, not inline in it.
+    [ -d /bin ]   && args+=(--ro-bind /bin /bin)
+    [ -d /lib ]   && args+=(--ro-bind /lib /lib)
+    [ -d /lib64 ] && args+=(--ro-bind /lib64 /lib64)
+    [ -d /sbin ]  && args+=(--ro-bind /sbin /sbin)
+    # The extraction target dir needs to be WRITABLE inside the sandbox
+    # (that's the whole point — the extracted files have to land
+    # somewhere this worker can then read back out).
+    args+=(--bind "$target_dir" "$target_dir" --tmpfs /tmp)
+    # FIX (real bug found in testing): the ARCHIVE FILE ITSELF lives
+    # somewhere else entirely (wherever it was found on the scanned
+    # tree) — --unshare-all + explicit binds means NOTHING outside those
+    # binds is visible at all, so the extraction tool couldn't even open
+    # its own input file ("cannot find or open ..."). Bind its containing
+    # directory read-only too, same real path as outside, so the
+    # extraction command's own "$archive" argument still resolves.
+    if [ -n "$archive_src" ]; then
+        local archive_dir; archive_dir=$(dirname "$archive_src")
+        args+=(--ro-bind "$archive_dir" "$archive_dir")
+    fi
+    # FIX (second, separate instance of the SAME bug — found right after
+    # fixing the first): the extraction tool ITSELF is very often our own
+    # bundled busybox (e.g. "$BUSYBOX_BIN unzip"), installed somewhere
+    # under this scanner's OWN directory tree — NOT under /bin or /usr, so
+    # it was ALSO invisible inside the sandbox, and extraction failed
+    # silently for the exact same "can't find the binary" reason.
+    if [ -n "$BUSYBOX_BIN" ] && [ -x "$BUSYBOX_BIN" ]; then
+        local bb_dir; bb_dir=$(dirname "$BUSYBOX_BIN")
+        args+=(--ro-bind "$bb_dir" "$bb_dir")
+    fi
+    bwrap "${args[@]}" -- "$@"
+}
+
+_sandbox_run_unshare() {
+    local target_dir="$1" archive_src="$2"; shift 2
+    # --user needs unprivileged user namespaces enabled in the kernel —
+    # not universal (disabled on some hardened kernels/containers). Falls
+    # through to the caller's own fallback chain if this exits non-zero.
+    # NOTE: unlike bwrap/chroot, this does NOT pivot/chroot the root
+    # filesystem — it only gets its own independent mount table, so the
+    # archive's original path stays visible without any extra binding.
+    unshare --user --map-root-user --pid --mount --ipc --uts --fork --kill-child -- \
+        bash -c 'mount -t proc proc /proc 2>/dev/null || true; cd "$1"; shift; exec "$@"' \
+        _ "$target_dir" "$@"
+}
+
+_sandbox_run_chroot() {
+    local target_dir="$1" archive_src="$2"; shift 2
+    [ "$(id -u)" = "0" ] || { "$@"; return; }  # chroot needs root
+    local chroot_dir
+    chroot_dir=$(mktemp -d /tmp/av_chroot.XXXXXX 2>/dev/null) || { "$@"; return; }
+    mkdir -p "$chroot_dir"/{bin,lib,lib64,usr,proc,dev,sbin} 2>/dev/null
+
+    # FIX (real bug found in testing): binding target_dir to "$chroot_dir/tmp"
+    # and cd-ing to /tmp inside the jail looked reasonable, but the
+    # extraction COMMAND itself (built in _archive_extract, which has no
+    # idea it might run inside a chroot) still references target_dir by
+    # its ORIGINAL absolute path (e.g. "-d /dev/shm/av_arch_XXXXXX") — a
+    # path that doesn't exist inside a jail that only knows it as /tmp.
+    # Confirmed: extraction silently found nothing (0 threats) with the
+    # old /tmp remap. Recreate target_dir at its OWN real path inside the
+    # jail instead, matching what bwrap mode already does with --bind.
+    mkdir -p "${chroot_dir}${target_dir}" 2>/dev/null
+
+    local -a mounted=()
+    _cbind() { mount --bind "$1" "$2" 2>/dev/null && mounted+=("$2"); }
+    [ -d /bin ]   && _cbind /bin   "$chroot_dir/bin"
+    [ -d /lib ]   && _cbind /lib   "$chroot_dir/lib"
+    [ -d /lib64 ] && _cbind /lib64 "$chroot_dir/lib64"
+    [ -d /usr ]   && _cbind /usr   "$chroot_dir/usr"
+    [ -d /sbin ]  && _cbind /sbin  "$chroot_dir/sbin"
+    mount -t proc proc "$chroot_dir/proc" 2>/dev/null && mounted+=("$chroot_dir/proc")
+    _cbind "$target_dir" "${chroot_dir}${target_dir}"
+
+    # FIX (same class of bug as bwrap mode, found right after fixing that
+    # one): the archive file itself lives OUTSIDE target_dir — bind its
+    # containing directory too (read-only), same real path, so the
+    # extraction command can still open its own input file inside the jail.
+    if [ -n "$archive_src" ]; then
+        local archive_dir; archive_dir=$(dirname "$archive_src")
+        mkdir -p "${chroot_dir}${archive_dir}" 2>/dev/null
+        mount --bind "$archive_dir" "${chroot_dir}${archive_dir}" 2>/dev/null && mount -o remount,ro,bind "${chroot_dir}${archive_dir}" 2>/dev/null
+        mounted+=("${chroot_dir}${archive_dir}")
+    fi
+
+    # FIX (third instance of the same bug, found right after archive_src):
+    # the extraction tool itself is very often our own bundled busybox,
+    # installed under this scanner's OWN directory — not /bin or /usr —
+    # so it was ALSO invisible inside the jail. Bind that in too.
+    if [ -n "$BUSYBOX_BIN" ] && [ -x "$BUSYBOX_BIN" ]; then
+        local bb_dir; bb_dir=$(dirname "$BUSYBOX_BIN")
+        mkdir -p "${chroot_dir}${bb_dir}" 2>/dev/null
+        mount --bind "$bb_dir" "${chroot_dir}${bb_dir}" 2>/dev/null && mount -o remount,ro,bind "${chroot_dir}${bb_dir}" 2>/dev/null
+        mounted+=("${chroot_dir}${bb_dir}")
+    fi
+
+    # FIX: unmount everything (reverse order — last mounted, first
+    # unmounted, matters when one mount is nested under another) BEFORE
+    # removing the directory, not just rm -rf on top of active mounts.
+    _cleanup_chroot() {
+        local i
+        for (( i=${#mounted[@]}-1; i>=0; i-- )); do
+            umount "${mounted[$i]}" 2>/dev/null || umount -l "${mounted[$i]}" 2>/dev/null || true
+        done
+        rm -rf "$chroot_dir" 2>/dev/null
+    }
+    trap _cleanup_chroot RETURN
+
+    chroot "$chroot_dir" /bin/bash -c 'cd "$1"; shift; exec "$@"' _ "$target_dir" "$@"
+}
+
+_sandbox_run_simple() {
+    local target_dir="$1" archive_src="$2"; shift 2
+    # NOTE: simple mode doesn't isolate the filesystem view at all (just
+    # drops privileges + resource limits), so the archive's own read
+    # permissions still apply as-is after the UID switch — if it's only
+    # readable by root (protected directory), extraction under "nobody"
+    # can still fail for that reason. Known, documented limitation of
+    # this specific mode; bwrap/chroot don't have it since they instead
+    # explicitly bind the archive's directory in.
+    #
+    # FIX: sudo often isn't installed at all on minimal VPS images
+    # (confirmed missing in testing) — setpriv (util-linux, near-universal
+    # on Linux) drops privileges without needing sudo configured at all.
+    local dropper=()
+    if [ "$(id -u)" = "0" ]; then
+        # FIX (real bug found in testing): mktemp -d creates directories
+        # mode 0700 — root-owned, unreadable/unwritable by anyone else.
+        # Dropping to an unprivileged user for extraction WITHOUT first
+        # opening up the target dir means the extraction tool can't write
+        # into it at all, failing silently (confirmed: 0 threats found on
+        # an archive that should have had 1 — extraction produced nothing
+        # because "nobody" had no permission to write there). chmod while
+        # still root, before dropping privileges.
+        chmod 0777 "$target_dir" 2>/dev/null
+        if _sandbox_has setpriv; then
+            dropper=(setpriv --reuid 65534 --regid 65534 --clear-groups)
+        elif _sandbox_has runuser; then
+            dropper=(runuser -u "$SANDBOX_USER" --)
+        fi
+    fi
+    # FIX: ulimit -v (virtual memory) routinely breaks legitimate binaries
+    # that reserve large address space upfront (thread stacks, mmap'd
+    # shared libs) even when actual RSS usage is modest — using -m (RSS,
+    # where the OS enforces it) instead avoids killing extraction tools
+    # that were never actually going to use that much real memory.
+    (
+        ulimit -t "$SANDBOX_CPU_SEC" 2>/dev/null
+        ulimit -f 512000 2>/dev/null
+        ulimit -n 256 2>/dev/null
+        ulimit -u 128 2>/dev/null
+        cd "$target_dir" 2>/dev/null || true
+        if [ ${#dropper[@]} -gt 0 ]; then
+            "${dropper[@]}" "$@"
+        else
+            "$@"
+        fi
+    )
+}
+
+# run_sandboxed TARGET_DIR ARCHIVE_SRC CMD...
+# TARGET_DIR is the extraction destination — needs to stay reachable
+# (writable) inside whichever isolation mode runs. ARCHIVE_SRC is the
+# archive file's own path — filesystem-isolating modes (bwrap/chroot)
+# need read access to it explicitly bound in too, since it normally lives
+# somewhere else entirely on the scanned tree, not under TARGET_DIR.
+# Falls all the way through to running CMD un-sandboxed only for
+# SANDBOX_MODE=none (explicit opt-out, not a silent fallback).
+run_sandboxed() {
+    local target_dir="$1" archive_src="$2"; shift 2
+    local mode="$SANDBOX_MODE"
+    if [ "$mode" = "auto" ]; then
+        if _sandbox_has bwrap; then mode="bwrap"
+        elif _sandbox_has unshare; then mode="unshare"
+        else mode="simple"; fi
+    fi
+    case "$mode" in
+        bwrap)    _sandbox_has bwrap    && { _sandbox_run_bwrap "$target_dir" "$archive_src" "$@"; return; } ;;
+        unshare)  _sandbox_has unshare  && { _sandbox_run_unshare "$target_dir" "$archive_src" "$@"; return; } ;;
+        chroot)   _sandbox_has chroot   && { _sandbox_run_chroot "$target_dir" "$archive_src" "$@"; return; } ;;
+        simple)   { _sandbox_run_simple "$target_dir" "$archive_src" "$@"; return; } ;;
+        none|*)   "$@"; return ;;
+    esac
+    # Requested mode's tool isn't actually available -> run unsandboxed
+    # rather than silently fail extraction entirely.
+    "$@"
+}
+
 _archive_extract() {
     local archive="$1" atype="$2" extract_dir="$3"
     # FIX: `timeout CMD` execs CMD as a real process — it cannot see shell
@@ -3115,43 +4624,48 @@ _archive_extract() {
     # command not found" (exit 127) every time, silently (stderr
     # discarded), extracting nothing. Resolve the real command (busybox
     # binary + applet, or the system tool) into a plain string BEFORE
-    # handing it to timeout, same lookup bb() does internally.
+    # handing it to timeout, same lookup bb() does internally. Same
+    # reasoning applies to run_sandboxed below — it's also a shell
+    # function, so `timeout` has to wrap the REAL command being passed
+    # INTO it, not run_sandboxed itself.
     local unzip_c="unzip" tar_c="tar" gunzip_c="gunzip"
     case "$BB_APPLETS" in *" unzip "*)  unzip_c="$BUSYBOX_BIN unzip" ;; esac
     case "$BB_APPLETS" in *" tar "*)    tar_c="$BUSYBOX_BIN tar" ;; esac
     case "$BB_APPLETS" in *" gunzip "*) gunzip_c="$BUSYBOX_BIN gunzip" ;; esac
     case "$atype" in
-        zip)    timeout 30 $unzip_c -qq -o "$archive" -d "$extract_dir" 2>/dev/null ;;
-        tar)    timeout 30 $tar_c -xf "$archive" -C "$extract_dir" 2>/dev/null ;;
-        targz)  timeout 30 $tar_c -xzf "$archive" -C "$extract_dir" 2>/dev/null ;;
-        tarbz2) timeout 30 $tar_c -xjf "$archive" -C "$extract_dir" 2>/dev/null ;;
-        tarxz)  timeout 30 $tar_c -xJf "$archive" -C "$extract_dir" 2>/dev/null ;;
-        gz)     timeout 30 $gunzip_c -c "$archive" > "$extract_dir/$(basename "${archive%.gz}")" 2>/dev/null ;;
-        bz2)    timeout 30 bunzip2 -c "$archive" > "$extract_dir/$(basename "${archive%.bz2}")" 2>/dev/null ;;
-        xz)     timeout 30 unxz -c "$archive" > "$extract_dir/$(basename "${archive%.xz}")" 2>/dev/null ;;
-        7z)     timeout 30 7z x -y -o"$extract_dir" "$archive" &>/dev/null ;;
+        zip)    run_sandboxed "$extract_dir" "$archive" timeout 30 $unzip_c -qq -o "$archive" -d "$extract_dir" 2>/dev/null ;;
+        tar)    run_sandboxed "$extract_dir" "$archive" timeout 30 $tar_c -xf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        targz)  run_sandboxed "$extract_dir" "$archive" timeout 30 $tar_c -xzf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        tarbz2) run_sandboxed "$extract_dir" "$archive" timeout 30 $tar_c -xjf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        tarxz)  run_sandboxed "$extract_dir" "$archive" timeout 30 $tar_c -xJf "$archive" -C "$extract_dir" 2>/dev/null ;;
+        gz)     run_sandboxed "$extract_dir" "$archive" timeout 30 $gunzip_c -c "$archive" > "$extract_dir/$(basename "${archive%.gz}")" 2>/dev/null ;;
+        bz2)    run_sandboxed "$extract_dir" "$archive" timeout 30 bunzip2 -c "$archive" > "$extract_dir/$(basename "${archive%.bz2}")" 2>/dev/null ;;
+        xz)     run_sandboxed "$extract_dir" "$archive" timeout 30 unxz -c "$archive" > "$extract_dir/$(basename "${archive%.xz}")" 2>/dev/null ;;
+        7z)     run_sandboxed "$extract_dir" "$archive" timeout 30 7z x -y -o"$extract_dir" "$archive" &>/dev/null ;;
         rar)
             if command -v unrar &>/dev/null; then
-                timeout 30 unrar x -y "$archive" "$extract_dir/" &>/dev/null
+                run_sandboxed "$extract_dir" "$archive" timeout 30 unrar x -y "$archive" "$extract_dir/" &>/dev/null
             else
-                timeout 30 7z x -y -o"$extract_dir" "$archive" &>/dev/null
+                run_sandboxed "$extract_dir" "$archive" timeout 30 7z x -y -o"$extract_dir" "$archive" &>/dev/null
             fi
             ;;
     esac
 }
 
-# Checks ONE extracted file (from inside an archive) against hash/YARA/
-# string signatures and reports against the ORIGINAL ARCHIVE if it matches.
-# Not batched (archives are opt-in / lower volume than the main file
-# stream), so this does direct per-file checks rather than queueing into
-# the shared BATCH_* arrays.
 _archive_tmpdir() {
-    # Extract into RAM (/dev/shm) when there's room, same reasoning as the
-    # main WORK_DIR: much less I/O-bound than disk, which matters most on
-    # exactly the kind of low-end VPS where every bit of speed counts.
-    # Respects --no-ram (USE_RAM=false) and falls back to disk if /dev/shm
-    # doesn't have enough free space for the configured extraction cap.
-    if [ "$USE_RAM" = "true" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    local compressed_size_mb="${1:-0}"
+    # Extract into RAM (/dev/shm) when it makes sense, same reasoning as
+    # the main WORK_DIR: much less I/O-bound than disk, which matters most
+    # on exactly the kind of low-end/IOPS-capped VPS where every bit of
+    # speed counts. Two conditions, both must hold:
+    #   1. the ARCHIVE's own compressed size is under ARCHIVE_RAM_MAX_MB
+    #      (default 50) — bounds how much RAM one archive can claim,
+    #      independent of the (much larger) ARCHIVE_MAX_EXTRACT_MB bomb
+    #      guard, which is about the DECOMPRESSED size instead.
+    #   2. /dev/shm actually has that much free right now.
+    # Respects --no-ram (USE_RAM=false); falls back to disk for archives
+    # over the threshold, or when /dev/shm doesn't have room.
+    if [ "$ARCHIVE_USE_RAM" = "true" ] && [ "$compressed_size_mb" -le "$ARCHIVE_RAM_MAX_MB" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
         local avail
         avail=$(df -m /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
         if [ "${avail:-0}" -ge "$ARCHIVE_MAX_EXTRACT_MB" ]; then
@@ -3166,31 +4680,60 @@ _archive_tmpdir() {
 # itself uses the same fast grep -qF path the main scan uses.
 _archive_batch_hash_check() {
     local top_archive="$1" extract_dir="$2" cur_rel="$3"; shift 3
-    local m msize rel
+
+    # FIX (real hang reported: an 18MB DLE zip "hanging" for over a
+    # minute): despite the name, this used to loop per-member, calling
+    # sha256sum/md5sum AND a busybox-grep lookup against sha256.tsv/
+    # md5.tsv SEPARATELY FOR EVERY FILE inside the archive — exactly the
+    # same per-file overhead problem already fixed for the main scan
+    # pipeline (busybox grep against the 632k-line md5.tsv alone measured
+    # ~1.5s/call), just never applied here. A few hundred files inside one
+    # archive meant a few hundred seconds. Now genuinely batched, same
+    # pattern as process_hash_batch(): hash the whole member set in ONE
+    # command, look up ALL hashes in ONE grep call, via the fast
+    # bundled/system grep (_real_grep), not busybox's.
+    local -a valid=()
+    local m msize
     for m in "$@"; do
         msize=$(_stat_size "$m" 2>/dev/null) || continue
         { [ "${msize:-0}" -eq 0 ] || [ "${msize:-0}" -gt "$MAX_SIZE" ]; } && continue
-        rel="${m#$extract_dir/}"
-        [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
-
-        if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
-            local h
-            h=$($SHA256_CMD "$m" 2>/dev/null | bb grep -oE '[0-9a-f]{64}' | head -1)
-            if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/sha256.tsv" 2>/dev/null; then
-                local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/sha256.tsv" | cut -f2)
-                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|sha256=$h"
-                continue
-            fi
-        fi
-        if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
-            local h
-            h=$($MD5_CMD "$m" 2>/dev/null | bb grep -oE '[0-9a-f]{32}' | head -1)
-            if [ -n "$h" ] && bb grep -qF "$h" "$SIG_DIR/md5.tsv" 2>/dev/null; then
-                local n; n=$(bb grep -m1 "^$h" "$SIG_DIR/md5.tsv" | cut -f2)
-                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|md5=$h"
-            fi
-        fi
+        valid+=("$m")
     done
+    [ ${#valid[@]} -eq 0 ] && return
+
+    local rel out hits h n
+
+    if [ "$HAS_SHA256" = true ] && [ "$SHA256_CMD" != "none" ]; then
+        out=$($SHA256_CMD "${valid[@]}" 2>/dev/null)
+        hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | _real_grep -F -f - "$SIG_DIR/sha256.tsv" 2>/dev/null | cut -f1)
+        if [ -n "$hits" ]; then
+            while IFS= read -r h; do
+                [ -z "$h" ] && continue
+                n=$(_real_grep -m 1 "^${h}" "$SIG_DIR/sha256.tsv" 2>/dev/null | cut -f2)
+                m=$(printf '%s\n' "$out" | bb grep -iE "^${h}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
+                [ -z "$m" ] && continue
+                rel="${m#$extract_dir/}"
+                [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|sha256=$h"
+            done <<< "$hits"
+        fi
+    fi
+
+    if [ "$HAS_MD5" = true ] && [ "$MD5_CMD" != "none" ]; then
+        out=$($MD5_CMD "${valid[@]}" 2>/dev/null)
+        hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | _real_grep -F -f - "$SIG_DIR/md5.tsv" 2>/dev/null | cut -f1)
+        if [ -n "$hits" ]; then
+            while IFS= read -r h; do
+                [ -z "$h" ] && continue
+                n=$(_real_grep -m 1 "^${h}" "$SIG_DIR/md5.tsv" 2>/dev/null | cut -f2)
+                m=$(printf '%s\n' "$out" | bb grep -iE "^${h}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
+                [ -z "$m" ] && continue
+                rel="${m#$extract_dir/}"
+                [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
+                threat "KNOWN_MALWARE" "$top_archive" "archive_member=${rel}|name=${n:-Malware}|md5=$h"
+            done <<< "$hits"
+        fi
+    fi
 }
 
 # Batched YARA check across ALL members of one archive in ONE call. This is
@@ -3203,7 +4746,19 @@ _archive_batch_yara_check() {
     local top_archive="$1" extract_dir="$2" cur_rel="$3"; shift 3
     [ $# -eq 0 ] && return
 
-    local yflags=(-d filename= -d filepath= -d extension=)
+    # FIX (real bug found — confirmed via YARA CLI source: `static int
+    # threads = YR_MAX_THREADS;`): without an explicit -p, yara defaults to
+    # its MAXIMUM allowed thread count, not something sane like nproc. That
+    # meant EVERY single yara invocation — and we already run one PER
+    # WORKER PROCESS, i.e. our own -j-controlled parallelism — was ALSO
+    # spawning its own large internal thread pool, all fighting over the
+    # same CPU cores as every other worker's yara call. Confirmed on a
+    # real 2-CPU box: 7+ concurrent yara threads/processes, load average
+    # ~5 on 2 cores — severe oversubscription that tanks throughput
+    # despite high CPU%, not genuine parallel speedup. -p 1 makes each
+    # yara call single-threaded; the worker-process level (-j) is where
+    # parallelism should live, not duplicated inside every yara call too.
+    local yflags=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC")
     case "$YARA_TARGET" in *.yarc) yflags+=(-C) ;; esac
 
     local yara_out
@@ -3211,7 +4766,7 @@ _archive_batch_yara_check() {
         local listfile
         listfile=$(mktemp 2>/dev/null) || return
         printf '%s\n' "$@" > "$listfile"
-        yara_out=$($YARA_CMD "${yflags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yflags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
         rm -f "$listfile"
     else
         local tmpdir2
@@ -3221,7 +4776,7 @@ _archive_batch_yara_check() {
             ln -sf "$f" "$tmpdir2/$(basename "$f")_$RANDOM" 2>/dev/null
         done
         local raw
-        raw=$($YARA_CMD "${yflags[@]}" -r "$YARA_TARGET" "$tmpdir2" 2>/dev/null)
+        raw=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yflags[@]}" -r "$YARA_TARGET" "$tmpdir2" 2>/dev/null)
         if [ -n "$raw" ]; then
             yara_out=$(while IFS= read -r l; do
                 [ -z "$l" ] && continue
@@ -3240,12 +4795,13 @@ _archive_batch_yara_check() {
     while IFS= read -r yline; do
         [ -z "$yline" ] && continue
         yrule=$(echo "$yline" | awk '{print $1}')
-        [ "$yrule" = "__av_b64_screen__" ] && continue
         yfile=$(echo "$yline" | cut -d' ' -f2-)
         rel="${yfile#$extract_dir/}"
         [ -n "$cur_rel" ] && rel="${cur_rel}!${rel}"
         if spat=$(_resolve_str_sig "$yrule"); then
             threat "SIG_STRING_MATCH" "$top_archive" "archive_member=${rel}|pattern=${spat:0:50}"
+        elif _is_vendor_obfuscation "$yrule" "$yfile"; then
+            SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
         else
             threat "YARA_MATCH" "$top_archive" "archive_member=${rel}|rule=$yrule"
         fi
@@ -3269,7 +4825,7 @@ scan_archive() {
     [ -z "$atype" ] && return
 
     local extract_dir
-    extract_dir=$(_archive_tmpdir) || return
+    extract_dir=$(_archive_tmpdir $(( asize / 1024 / 1024 ))) || return
 
     _archive_extract "$cur" "$atype" "$extract_dir"
 
@@ -3369,8 +4925,20 @@ log() { printf '[%s] %s\n' "$WORKER_ID" "$*" >> "$REPORT"; }
 threat() {
     local type="$1" file="$2" info="${3:-}"
 
-    if [ -n "$IGNORE_SIGS_FILE" ] && [ -s "$IGNORE_SIGS_FILE" ]; then
-        if printf '%s|%s\n' "$type" "$info" | bb grep -qE -f "$IGNORE_SIGS_FILE" 2>/dev/null; then
+    # NOTE: matched string includes the file PATH too (not just type+info)
+    # — lets ignore_sigs patterns be scoped to specific paths, e.g.
+    # suppress a noisy rule only under a known-legitimate directory
+    # instead of everywhere it might ever fire. Old simple patterns (no
+    # anchors) keep working unchanged, since they just match as a
+    # substring regardless of what else is on the line.
+    #
+    # DEEP_MODE bypasses this entirely — the whole point of --deep is
+    # maximum precision with no automatic suppression at all; the person
+    # reviews and dismisses findings themselves rather than trusting the
+    # tool's own filters, which is exactly what a deep/paranoid pass is
+    # for.
+    if [ "$DEEP_MODE" != "true" ] && [ -n "$IGNORE_SIGS_FILE" ] && [ -s "$_IGNORE_SIGS_FILTERED" ]; then
+        if printf '%s|%s|%s\n' "$type" "$info" "$file" | bb grep -qE -f "$_IGNORE_SIGS_FILTERED" 2>/dev/null; then
             SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
             return
         fi
@@ -3431,6 +4999,7 @@ process_hash_batch() {
     [ $# -eq 0 ] && return
     local cmd="$SHA256_CMD"
     [ "$htype" = "md5" ] && cmd="$MD5_CMD"
+    [ "$htype" = "sha1" ] && cmd="$SHA1_CMD"
     [ "$cmd" = "none" ] && return
 
     local out
@@ -3439,13 +5008,21 @@ process_hash_batch() {
 
     # "grep -F -f - sig_file" returns full "hash<TAB>name" lines, not just
     # the hash — the trailing "cut -f1" extracts the clean hash.
+    #
+    # FIX (real bottleneck found and measured on a live scan — hash
+    # lookups were 69% of total scan time): this used to go through
+    # busybox's grep, which measured ~2.2x slower than a real grep for
+    # exactly this shape of query (-F -f - against a 632k-line hash
+    # database — confirmed 1528ms vs 701ms per call on a realistic
+    # benchmark). Same fix already applied to the string-signature search
+    # — use _real_grep (bundled/system grep) here too.
     local hits
-    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | bb grep -F -f - "$sig_file" 2>/dev/null | cut -f1)
+    hits=$(printf '%s\n' "$out" | cut -d' ' -f1 | _real_grep -F -f - "$sig_file" 2>/dev/null | cut -f1)
     if [ -n "$hits" ]; then
         while IFS= read -r hit_hash; do
             [ -z "$hit_hash" ] && continue
             local tname
-            tname=$(bb grep -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -f2)
+            tname=$(_real_grep -m 1 "^${hit_hash}" "$sig_file" 2>/dev/null | cut -f2)
             local hit_file
             hit_file=$(printf '%s\n' "$out" | bb grep -iE "^${hit_hash}\s+" | sed 's/^[^ ]*[ ]*//' | head -1)
             [ -n "$hit_file" ] && threat "KNOWN_MALWARE" "$hit_file" "name=${tname:-Malware}|$htype=$hit_hash"
@@ -3456,10 +5033,50 @@ process_hash_batch() {
 # ----------------------------------------------------------------------------
 # MODULE: yara matching
 # ----------------------------------------------------------------------------
+# Called when a --scan-list batch hit (or nearly hit) the -a timeout —
+# retries the SAME batch one file at a time with a short per-file timeout,
+# so a single pathological file doesn't cost the whole batch's results and
+# gets identified by name instead of just "the scan is stuck".
+_yara_bisect_slow_batch() {
+    local short_timeout=5
+    [ "$YARA_TIMEOUT_SEC" -lt 20 ] && short_timeout=$(( YARA_TIMEOUT_SEC / 4 ))
+    [ "$short_timeout" -lt 2 ] && short_timeout=2
+
+    local yflags2=(-d filename= -d filepath= -d extension= -p 1 -a "$short_timeout")
+    case "$YARA_TARGET" in *.yarc) yflags2+=(-C) ;; esac
+
+    local f t0 t1 out
+    for f in "$@"; do
+        t0=$(_now_ms)
+        out=$(timeout $(( short_timeout + 2 )) $YARA_CMD "${yflags2[@]}" "$YARA_TARGET" "$f" 2>/dev/null)
+        t1=$(_now_ms)
+        if [ $(( (t1 - t0) / 1000 )) -ge "$short_timeout" ]; then
+            # This is the (or a) culprit — report it as a diagnostic entry
+            # (not necessarily malicious — pathologically slow-to-scan
+            # files are usually just unusual content, e.g. one enormous
+            # minified line — but worth the person's attention either way)
+            # and move on instead of hanging the whole scan on it.
+            threat "SCAN_TIMEOUT" "$f" "yara_timeout_sec=${short_timeout}|note=file took too long to scan, skipped"
+            continue
+        fi
+        [ -z "$out" ] && continue
+        local yrule yfile spat
+        yrule=$(echo "$out" | head -1 | awk '{print $1}')
+        yfile="$f"
+        if spat=$(_resolve_str_sig "$yrule"); then
+            threat "SIG_STRING_MATCH" "$yfile" "pattern=${spat:0:50}"
+        elif _is_vendor_obfuscation "$yrule" "$yfile"; then
+            SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
+        else
+            threat "YARA_MATCH" "$yfile" "rule=$yrule"
+        fi
+    done
+}
+
 process_yara_batch() {
     [ $# -eq 0 ] || [ "$HAS_YARA" = false ] || [ "$YARA_CMD" = "none" ] && return
 
-    local yara_out yara_flags=(-d filename= -d filepath= -d extension=)
+    local yara_out yara_flags=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC")
     # A compiled ruleset (.yarc) MUST be loaded with -C, or yara tries to
     # parse the binary as rule *source* and fails outright.
     case "$YARA_TARGET" in
@@ -3477,8 +5094,34 @@ process_yara_batch() {
         local listfile
         listfile=$(mktemp 2>/dev/null) || return
         printf '%s\n' "$@" > "$listfile"
-        yara_out=$($YARA_CMD "${yara_flags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        local t0; t0=$(_now_ms)
+        # FIX (real bug reported — "goes into infinity"): yara's own -a
+        # flag was measured NOT reliably capping --scan-list duration (a
+        # real batch took 74-113 SECONDS despite the configured 30s
+        # limit). Relying only on -a meant the elapsed-time check below
+        # would only ever fire AFTER yara eventually finished on its own,
+        # however long that took — defeating the whole point of a
+        # timeout. Wrap with the shell's own `timeout` (SIGTERM then
+        # SIGKILL at the OS level) as a HARD guarantee that doesn't depend
+        # on yara's internal timeout logic working correctly at all.
+        yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags[@]}" --scan-list "$YARA_TARGET" "$listfile" 2>/dev/null)
+        local t1; t1=$(_now_ms)
         rm -f "$listfile"
+
+        # FIX (real hang reported): a batch call that hits -a's timeout
+        # aborts the WHOLE --scan-list operation, losing results for every
+        # OTHER file in the batch too — not just the slow one. Detect a
+        # likely timeout by comparing actual elapsed time against the
+        # configured limit (yara doesn't give a clean distinct exit code
+        # for this), and if so, fall back to checking this SAME batch's
+        # files ONE AT A TIME with a much shorter per-file timeout: fast
+        # files still get scanned normally (nothing lost), and whichever
+        # file(s) also blow the short timeout get identified and reported
+        # instead of silently swallowing the whole batch or hanging again.
+        if [ $(( (t1 - t0) / 1000 )) -ge "$YARA_TIMEOUT_SEC" ]; then
+            _yara_bisect_slow_batch "$@"
+            return
+        fi
     else
         # Fallback for older yara builds without --scan-list: the CLI only
         # accepts ONE scan target (a file, or a directory with -r), so
@@ -3489,7 +5132,7 @@ process_yara_batch() {
         for f in "$@"; do
             ln -sf "$f" "$tmpdir/$(bb basename "$f" 2>/dev/null || basename "$f")_$RANDOM" 2>/dev/null
         done
-        yara_out=$($YARA_CMD "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
+        yara_out=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags[@]}" -r "$YARA_TARGET" "$tmpdir" 2>/dev/null)
         # Symlink names don't map back to real paths 1:1 in this fallback
         # path (RANDOM-suffixed to avoid collisions) — resolve via readlink.
         if [ -n "$yara_out" ]; then
@@ -3505,24 +5148,15 @@ process_yara_batch() {
     fi
 
     if [ -n "$yara_out" ]; then
-        local -A b64_screened=()
         while IFS= read -r yline; do
             [ -z "$yline" ] && continue
             local yrule; yrule=$(echo "$yline" | awk '{print $1}')
             local yfile; yfile=$(echo "$yline" | cut -d' ' -f2-)
-            if [ "$yrule" = "__av_b64_screen__" ]; then
-                # Not a threat by itself — just means "this file has a
-                # long base64-looking string somewhere". Do the (rarer)
-                # decode+check follow-up for THIS file only, once, instead
-                # of every file getting its own separate grep read.
-                [ -n "${b64_screened[$yfile]:-}" ] && continue
-                b64_screened[$yfile]=1
-                _check_b64_payload "$yfile"
-                continue
-            fi
             local spat
             if spat=$(_resolve_str_sig "$yrule"); then
                 threat "SIG_STRING_MATCH" "$yfile" "pattern=${spat:0:50}"
+            elif _is_vendor_obfuscation "$yrule" "$yfile"; then
+                SUPPRESSED_FOUND=$(( SUPPRESSED_FOUND + 1 ))
             else
                 threat "YARA_MATCH" "$yfile" "rule=$yrule"
             fi
@@ -3623,14 +5257,14 @@ process_heuristic_batch() {
 
 # Decodes and checks candidate base64 chunks in ONE file: hash-lookup
 # against known payloads, then (if still unmatched) a follow-up YARA scan
-# of the DECODED content for anything ELF/PE/script-shaped. Extracted out
-# of check_file_heuristics so it can be called SELECTIVELY — only for
-# files that the YARA screening rule (__av_b64_screen__, see
-# compile_signatures) already flagged as containing a long base64-looking
-# string — instead of every scanned file getting its own separate
-# grep -oE read. On an IOPS-capped host this is the whole point: it's not
-# about CPU or fork count, it's about not opening/reading each file an
-# extra time for a check that, for most files, finds nothing at all.
+# of the DECODED content for anything ELF/PE/script-shaped. Runs directly
+# per-file (via check_file_heuristics) — NOT gated behind a YARA screening
+# rule anymore. That WAS tried (an embedded "__av_b64_screen__" regex rule,
+# to save one read per file), but caused a real regression: YARA's regex
+# engine scales badly against a very long single-line base64-ish blob —
+# confirmed on real DLE installations, whose own license-obfuscated engine
+# files are exactly that shape, making specific files take 74-113+
+# SECONDS each. A plain `grep -oE` call handles the same content fine.
 _check_b64_payload() {
     local file="$1"
     while IFS= read -r chunk; do
@@ -3662,9 +5296,9 @@ _check_b64_payload() {
         local dtype="SCRIPT"
         case "$magic" in 7f454c46*) dtype="ELF" ;; 4d5a*) dtype="PE_MZ" ;; esac
         if [ "$HAS_YARA" = true ]; then
-            local yara_flags3=(-d filename= -d filepath= -d extension=) yhit
+            local yara_flags3=(-d filename= -d filepath= -d extension= -p 1 -a "$YARA_TIMEOUT_SEC") yhit
             case "$YARA_TARGET" in *.yarc) yara_flags3+=(-C) ;; esac
-            yhit=$($YARA_CMD "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
+            yhit=$(timeout $(( YARA_TIMEOUT_SEC + 3 )) $YARA_CMD "${yara_flags3[@]}" "$YARA_TARGET" "$b64tmp" 2>/dev/null | head -1 | awk '{print $1}')
             [ -n "$yhit" ] && threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|yara=${yhit}|b64=${chunk:0:20}..."
         else
             threat "SUSPICIOUS_B64_PAYLOAD" "$file" "decoded=${dtype}|b64=${chunk:0:20}..."
@@ -3677,14 +5311,10 @@ check_file_heuristics() {
     local file="$1" size="$2" oct="$3"
 
     if [ "$size" -lt "$MAX_SIZE" ]; then
-        # Base64 payload check: only runs the (separate-read) grep scan
-        # here as a FALLBACK when YARA isn't available at all — when YARA
-        # IS available, __av_b64_screen__ already covers this in the SAME
-        # read as the string/pattern matching (see process_yara_batch),
-        # so doing it again here per-file would defeat the whole point.
-        if [ "$HAS_YARA" != true ]; then
-            _check_b64_payload "$file"
-        fi
+        # REVERTED to always running this own grep-based pass (see the
+        # REVERTED comment in compile_signatures for why) — no longer
+        # gated on HAS_YARA / a screening rule.
+        _check_b64_payload "$file"
     fi
 
     # Disguised
@@ -3720,13 +5350,25 @@ check_file_heuristics() {
             # (with 'unverified' or 'TAMPERED' noted, since a checksum
             # mismatch on a package-owned SUID binary is a strong compromise
             # indicator, not a minor discrepancy).
-            local suid_status
-            suid_status=$(_verify_package_file "$file")
-            case "$suid_status" in
-                verified) : ;;  # known-good system binary, no report
-                tampered) threat "SUID_SGID" "$file" "perms=$oct|TAMPERED (fails package checksum verification)" ;;
-                *)        threat "SUID_SGID" "$file" "perms=$oct" ;;
-            esac
+            #
+            # SUID_VERIFY_MODE gate: dpkg verification's value is catching
+            # a system binary being swapped WHILE something is watching —
+            # that's -w (real-time)'s job. A one-off audit scan (no cache,
+            # run once, the common case) gets nothing back for paying
+            # dpkg lookup cost on every SUID/SGID hit it'll never see
+            # again, so it just reports them plainly instead, same as
+            # before this feature existed.
+            if [ "$SUID_VERIFY_MODE" = "true" ]; then
+                local suid_status
+                suid_status=$(_verify_package_file "$file")
+                case "$suid_status" in
+                    verified) : ;;  # known-good system binary, no report
+                    tampered) threat "SUID_SGID" "$file" "perms=$oct|TAMPERED (fails package checksum verification)" ;;
+                    *)        threat "SUID_SGID" "$file" "perms=$oct" ;;
+                esac
+            else
+                threat "SUID_SGID" "$file" "perms=$oct"
+            fi
         fi
         (( 8#$oct & 8#0002 )) 2>/dev/null && (( 8#$oct & 8#0111 )) 2>/dev/null && threat "WORLD_WRITABLE_EXEC" "$file" "perms=$oct"
     fi
@@ -3769,6 +5411,19 @@ run_scan_loop() {
                 if [ "$MD5_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
                     _timed_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
                     BATCH_MD5=(); MD5_BATCH_CNT=0
+                fi
+            fi
+            # SHA1 gated the same way — only queued at all when the
+            # compiled signature set actually HAS sha1.tsv entries (a
+            # real ClamAV .hsb file with none would leave this HAS_SHA1
+            # false, and this whole extra per-file read never happens —
+            # no IOPS cost paid for a hash type nobody's database uses).
+            if [ "$HAS_SHA1" = true ] && [ "$SHA1_CMD" != "none" ]; then
+                BATCH_SHA1+=("$file")
+                SHA1_BATCH_CNT=$(( SHA1_BATCH_CNT + 1 ))
+                if [ "$SHA1_BATCH_CNT" -ge "$BATCH_SIZE" ]; then
+                    _timed_hash_batch "sha1" "$SIG_DIR/sha1.tsv" "${BATCH_SHA1[@]}"
+                    BATCH_SHA1=(); SHA1_BATCH_CNT=0
                 fi
             fi
 
@@ -3843,6 +5498,7 @@ run_scan_loop() {
 
     # Flush remaining batches
     [ "$SHA_BATCH_CNT" -gt 0 ] && _timed_hash_batch "sha256" "$SIG_DIR/sha256.tsv" "${BATCH_SHA[@]}"
+    [ "$SHA1_BATCH_CNT" -gt 0 ] && _timed_hash_batch "sha1" "$SIG_DIR/sha1.tsv" "${BATCH_SHA1[@]}"
     [ "$MD5_BATCH_CNT" -gt 0 ] && _timed_hash_batch "md5" "$SIG_DIR/md5.tsv" "${BATCH_MD5[@]}"
     [ "$YARA_BATCH_CNT" -gt 0 ] && _timed_yara_batch "${BATCH_YARA[@]}"
     [ "$HEUR_BATCH_CNT" -gt 0 ] && _timed_heur_batch "${BATCH_HEUR[@]}"
@@ -3857,6 +5513,7 @@ finalize_worker() {
     printf 'FILES_SCANNED:%d\nTHREATS_FOUND:%d\nSUPPRESSED:%d\n' "$FILES_SCANNED" "$THREATS_FOUND" "$SUPPRESSED_FOUND" >> "$REPORT"
     printf 'TIMING_HASH_MS:%d\nTIMING_YARA_MS:%d\nTIMING_HEUR_MS:%d\nTIMING_PE_MS:%d\n' "$T_HASH_MS" "$T_YARA_MS" "$T_HEUR_MS" "$T_PE_MS" >> "$REPORT"
     log "Completed - files: $FILES_SCANNED, threats: $THREATS_FOUND, suppressed: $SUPPRESSED_FOUND"
+    rm -f "$_IGNORE_SIGS_FILTERED" "$_GENERIC_OBFUSCATION_FILTERED" "$_KNOWN_VENDOR_OBFUSCATION_FILTERED" 2>/dev/null
     touch "${REPORT_DIR}/${WORKER_ID}.done"
 }
 
